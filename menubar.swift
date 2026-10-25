@@ -228,7 +228,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DispatchQueue.main.async {
                 if ms >= 0 {
                     self.latencyLine.title = "github.com:\(ms) ms"
-                } else if self.hostsOn().on {
+                } else if hostsOn().on {
                     // 已开启还不通 = 坏窗口(TLS 整段被丢),不是没加速
                     self.latencyLine.title = "github.com:链路波动中(通常几分钟内自动恢复)"
                     self.autoHealIfNeeded()

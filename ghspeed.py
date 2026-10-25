@@ -79,9 +79,9 @@ REFRESH_INTERVAL = 1800  # 秒
 try:
     with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "VERSION")) as _f:
-        __version__ = _f.read().strip() or "0.1.0"
+        __version__ = _f.read().strip() or "0.1.1"
 except Exception:
-    __version__ = "0.1.0"
+    __version__ = "0.1.1"
 
 # 只处理这些 GitHub 域名,一个都不多
 DOMAINS = [
