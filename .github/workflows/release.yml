@@ -52,25 +52,42 @@ jobs:
           name: linux
           path: ghspeed_*_all.deb
 
-  # ---------- Windows 10+:CLI + tkinter 简易界面 ----------
+  # ---------- Windows 10+:安装包(setup)+ 便携 zip,均内置运行时免装 Python ----------
   build-windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Package
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build exes (PyInstaller)
+        run: |
+          pip install pyinstaller pillow
+          python -c "from PIL import Image; im = Image.open('icons/icon_1024.png'); im.save('icons/icon.ico', sizes=[(16,16),(24,24),(32,32),(48,48),(64,64),(128,128),(256,256)])"
+          Copy-Item ghspeed_gui.pyw gui_entry.py
+          pyinstaller --onefile --noconsole --name GHSpeed --icon icons/icon.ico gui_entry.py
+          pyinstaller --onefile --name ghspeed --icon icons/icon.ico ghspeed.py
+
+      - name: Build installer (Inno Setup)
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Path stage\GHSpeed | Out-Null
-          Copy-Item ghspeed.py, ghspeed_gui.pyw, ghspeed.bat, README.md stage\GHSpeed\
+          choco install innosetup -y --no-progress
           $v = (Get-Content VERSION -Raw).Trim()
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DAppVersion=$v" packaging/windows/installer.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Path stage\GHSpeed | Out-Null
+          Copy-Item dist\GHSpeed.exe, dist\ghspeed.exe, ghspeed.py, ghspeed_gui.pyw, ghspeed.bat, README.md stage\GHSpeed\
           Compress-Archive -Path stage\GHSpeed -DestinationPath "GHSpeed-windows-${{ github.ref_name }}.zip"
-          Get-ChildItem *.zip
+          Get-ChildItem dist\*.exe, *.zip | Select-Object Name, Length
 
       - uses: actions/upload-artifact@v4
         with:
           name: windows
-          path: GHSpeed-windows-*.zip
+          path: |
+            dist/GHSpeed-windows-setup-*.exe
+            GHSpeed-windows-*.zip
 
   # ---------- 汇总发布(打 tag 时)----------
   release:
@@ -88,7 +105,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          FILES=$(find artifacts -type f \( -name "*.pkg" -o -name "*.zip" -o -name "*.deb" \) | tr '\n' ' ')
+          FILES=$(find artifacts -type f \( -name "*.pkg" -o -name "*.zip" -o -name "*.deb" -o -name "*.exe" \) | tr '\n' ' ')
           echo "发布文件: $FILES"
           cat > notes.md <<'EOF'
           ## GHSpeed ${{ github.ref_name }}
@@ -100,10 +117,11 @@ jobs:
              `xattr -d com.apple.quarantine ~/Downloads/GHSpeed-macos-*.pkg`
           2. 点菜单栏 🐙 → 「开启加速」(或用 `GHSpeed-macos-*.zip` 免安装)
 
-          ### Windows 10+(简易界面)
-          1. 先装 [Python 3](https://www.python.org/downloads/)(勾选 Add to PATH)
-          2. 解压 `GHSpeed-windows-*.zip`,双击 `GHSpeed_gui.pyw`(或命令行 `ghspeed.bat`)
-          3. 点「开启加速」,UAC 弹窗选「是」(需管理员改 hosts + 建计划任务)
+          ### Windows 10+(安装包,内置运行时,免装 Python)
+          1. 下载 \`GHSpeed-windows-setup-*.exe\` 双击安装
+             (未做代码签名,SmartScreen 若提示:点「更多信息」→「仍要运行」)
+          2. 打开 GHSpeed → 「开启加速」→ UAC 选「是」
+          3. 也可用 \`GHSpeed-windows-*.zip\` 便携版(解压双击 \`GHSpeed.exe\`)
 
           ### Linux / Debian(命令行,无 UI)
           ```

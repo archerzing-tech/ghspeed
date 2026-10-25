@@ -5,7 +5,7 @@ GitHub 加速工具:测速固定最快 IP + 镜像加速下载,只解决 GitHub 
 | 平台 | 界面 | 最低要求 |
 |---|---|---|
 | macOS | 菜单栏 🐙 | 10.13+ |
-| Windows | tkinter 简易窗口 + 命令行 | Windows 10+,Python 3 |
+| Windows | 安装包 / 便携版(tkinter 窗口)+ 命令行 | Windows 10+(运行时内置,无需装 Python) |
 | Linux(Debian 系) | 命令行(无 UI) | Python 3,systemd |
 
 ## 截图
@@ -57,11 +57,20 @@ cd ghspeed && sudo ./install.sh && sudo ghspeed on
 
 ### Windows 10+
 
-1. 先装 [Python 3](https://www.python.org/downloads/)(安装时勾选 **Add to PATH**)
-2. 下载 `GHSpeed-windows-*.zip` 解压,**双击 `GHSpeed_gui.pyw`** 打开界面(无黑窗口)
-3. 点「开启加速」→ UAC 弹窗选「是」,完成(需要管理员改 hosts + 建计划任务)
+**方式一:安装包(推荐,双击即装,内置运行时免装 Python)**
 
-命令行(管理员 PowerShell/CMD):`python ghspeed.py on` / `off` / `status`,或双击 `ghspeed.bat`。
+1. 下载 `GHSpeed-windows-setup-*.exe` 双击安装(可选桌面快捷方式、加入 PATH)
+2. 未做代码签名:SmartScreen 若拦截,点「更多信息」→「仍要运行」
+3. 打开 GHSpeed → 「开启加速」→ UAC 弹窗选「是」,完成
+   (卸载前建议以管理员运行 `ghspeed off` 还原 hosts 与计划任务,卸载器结束时会再提醒)
+
+**方式二:便携 zip**
+
+解压 `GHSpeed-windows-*.zip`,双击 `GHSpeed.exe`(运行时已内置,同样免装 Python)。
+
+**方式三:源码运行**(已有 Python 3 环境时)
+
+双击 `ghspeed_gui.pyw`,或命令行 `python ghspeed.py on` / `off` / `status` / 双击 `ghspeed.bat`。
 
 ### Linux / Debian(命令行,无 UI)
 

@@ -114,9 +114,13 @@ class App:
 
     def elevate(self, flag):
         """弹 UAC 重启自己;flag 让提权后的实例接着把事情做完"""
-        params = '"%s" %s' % (os.path.abspath(__file__), flag)
+        if getattr(sys, "frozen", False):  # PyInstaller 打包的 exe
+            target, params = sys.executable, flag
+        else:
+            target = sys.executable
+            params = '"%s" %s' % (os.path.abspath(__file__), flag)
         rc = ctypes.windll.shell32.ShellExecuteW(None, "runas",
-                                                 sys.executable, params, None, 1)
+                                                 target, params, None, 1)
         if rc > 32:
             self.root.destroy()
         else:

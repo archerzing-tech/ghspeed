@@ -79,9 +79,9 @@ REFRESH_INTERVAL = 1800  # 秒
 try:
     with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "VERSION")) as _f:
-        __version__ = _f.read().strip() or "0.1.1"
+        __version__ = _f.read().strip() or "0.2.0"
 except Exception:
-    __version__ = "0.1.1"
+    __version__ = "0.2.0"
 
 # 只处理这些 GitHub 域名,一个都不多
 DOMAINS = [
@@ -506,7 +506,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=%(exe)s %(script)s refresh --quiet
+ExecStart=%(exec_start)s
 Nice=10
 """
 
@@ -525,10 +525,18 @@ WantedBy=timers.target
 
 
 def daemon_install():
-    exe, script, minutes = sys.executable, os.path.realpath(__file__), REFRESH_INTERVAL // 60
+    if getattr(sys, "frozen", False):
+        # PyInstaller 打包的 ghspeed.exe:__file__ 指向临时解压目录,重启即失效,
+        # 只能以 exe 自身作为定时任务入口
+        exe, script, minutes = sys.executable, "", REFRESH_INTERVAL // 60
+    else:
+        exe, script, minutes = sys.executable, os.path.realpath(__file__), REFRESH_INTERVAL // 60
     if IS_WIN:
         # SYSTEM 账号自带管理员权限;TR 内层引号由 schtasks 约定为 \"
-        tr = '\\"%s\\" \\"%s\\" refresh --quiet' % (exe, script)
+        if script:
+            tr = '\\"%s\\" \\"%s\\" refresh --quiet' % (exe, script)
+        else:
+            tr = '\\"%s\\" refresh --quiet' % exe
         subprocess.run(["schtasks", "/Create", "/F", "/RU", "SYSTEM",
                         "/SC", "MINUTE", "/MO", str(minutes),
                         "/TN", WIN_TASK, "/TR", tr],
@@ -548,8 +556,12 @@ def daemon_install():
         if r.returncode != 0:  # 旧系统兜底
             subprocess.run(["launchctl", "load", "-w", PLIST_PATH], check=False)
     else:
+        args = "refresh --quiet"
+        exec_start = ("%s %s %s" % (exe, script, args)) if script else \
+                     ("%s %s" % (exe, args))
         for path, body in (
-                (SYSTEMD_SERVICE, SYSTEMD_SERVICE_TMPL % {"exe": exe, "script": script}),
+                (SYSTEMD_SERVICE, SYSTEMD_SERVICE_TMPL
+                 % {"exec_start": exec_start}),
                 (SYSTEMD_TIMER, SYSTEMD_TIMER_TMPL % {"minutes": minutes})):
             with open(path, "w") as f:
                 f.write(body)
