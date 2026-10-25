@@ -66,7 +66,6 @@ class App:
 
         self.busy = False
         self.tray = None            # 托盘图标(pystray),main() 里装配
-        self.hide_hint_shown = False
         self.live_mode = False      # 活动视图开着时每 3 秒自动刷新
         self._live_after = None
         self.refresh_ui()
@@ -211,14 +210,7 @@ class App:
     def toggle_dns(self):
         if self.busy:
             return
-        turning_on = not self.dns_on()
-        resumed = "--elevated-dns" in sys.argv  # 提权重启的续做实例,不再二次确认
-        if turning_on and not resumed and not messagebox.askyesno(
-                APP, "把系统 DNS 换成国内不投毒的公共 DNS"
-                     "(阿里 223.5.5.5 / 腾讯 119.29.29.29)?\n\n"
-                     "影响全部网站(不只 GitHub);原配置自动备份,"
-                     "之后点同一按钮即原样还原。"):
-            return
+        turning_on = not self.dns_on()   # 点按钮即切换,不弹确认窗;再点一次原样还原
         if not eng.is_admin():
             self.elevate("--elevated-dns")
             return
@@ -336,11 +328,11 @@ class App:
 
     def done(self, ok, msg):
         self.set_busy(False)
-        if ok:
-            messagebox.showinfo(APP, msg)
+        self.refresh_ui()
+        if ok:   # 成功不弹窗打扰,结果写在状态行;失败才弹
+            self.status.config(text="✅ " + msg, fg="#1a7f37")
         else:
             messagebox.showerror(APP, msg)
-        self.refresh_ui()
 
 
     # ---------------- 窗口/托盘 ----------------
@@ -351,14 +343,7 @@ class App:
         self.root.focus_force()
 
     def hide_to_tray(self):
-        self.root.withdraw()
-        if not self.hide_hint_shown:
-            self.hide_hint_shown = True
-            tip = ("已最小化到系统托盘 🐙(任务栏右下角)。\n"
-                   "双击托盘图标重新打开;右键托盘图标可退出。"
-                   if self.tray is not None else
-                   "窗口已关闭,后台定时刷新仍在运行。\n再次打开 GHSpeed.exe 可回到窗口。")
-            messagebox.showinfo(APP, tip)
+        self.root.withdraw()   # 直接缩到托盘,不弹提示窗(托盘图标即提示)
 
     def quit_app(self):
         if self.tray is not None:
