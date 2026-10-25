@@ -12,9 +12,21 @@ macOS 专用 GitHub 加速工具:菜单栏一键开关,只解决 GitHub 的问�
 
 ## 安装
 
-从 [Releases](../../releases) 下载 `GHSpeed-macos-*.zip`:
+从 [Releases](../../releases) 下载,二选一:
 
-1. 解压,把 `GHSpeed.app` 拖进「应用程序」
+**方式一:`.pkg` 安装包(推荐,双击即装)**
+
+1. 双击 `GHSpeed-macos-*.pkg` → 继续 → 安装,输入一次管理员密码
+   (自动装好「应用程序」里的 GHSpeed 和命令行 `ghspeed`)
+2. 浏览器下载的 pkg 带隔离属性,双击若被 Gatekeeper 拦截,任选其一:
+   - 终端执行 `xattr -d com.apple.quarantine ~/Downloads/GHSpeed-macos-*.pkg` 后重新双击
+   - 系统设置 → 隐私与安全性 → 点「仍要打开」
+   (应用未做 Apple 公证;pkg 装出来的 App 没有隔离属性,可直接打开)
+3. 点菜单栏 🐙 → 「开启加速」
+
+**方式二:zip 免安装**
+
+1. 解压 `GHSpeed-macos-*.zip`,把 `GHSpeed.app` 拖进「应用程序」
 2. 首次打开:右键点击 → 「打开」(ad-hoc 签名,绕过 Gatekeeper)
 3. 点菜单栏 🐙 → 「开启加速」,输入一次管理员密码,完成
 
@@ -80,16 +92,16 @@ GHSPEED_MIRRORS="https://your-mirror.example.com/" ghspeed dl <url>
 ## 已知限制
 
 - `raw.githubusercontent.com` 与 `gist.github.com` 在部分网络受 SNI 级阻断(与 IP 无关),hosts 钉不住浏览器访问——这两个域的资源走镜像下载(`ghspeed dl` / 菜单下载)即可
-- 本机直连链路若整段 TLS 被丢(坏窗口),`on` 会跨窗口重试(3/10/25 秒间隔,最多 4 轮);极端情况下部分域名可能仍钉不上,等 30 分钟守护自动补
+- 本机直连链路若整段 TLS 被丢(坏窗口),`on` 会跨窗口重试(3/8 秒间隔,最多 3 轮,长坏窗口交给 30 分钟守护);极端情况下部分域名可能仍钉不上,等 30 分钟守护自动补
 - 镜像列表内置 4 个公共 ghproxy 系镜像,失效时用 `GHSPEED_MIRRORS` 自行替换
 
 ## 构建
 
 ```bash
-./build_app.sh        # 需要 Xcode Command Line Tools(swiftc)
+./make_pkg.sh        # 产出 dist/GHSpeed-macos-*.pkg + GHSpeed.app(需 Xcode CLT 的 swiftc)
 ```
 
-产物在 `dist/GHSpeed.app`,自包含 `ghspeed.py` 引擎。
+App 自包含 `ghspeed.py` 引擎;打 `v*` 标签推送后 CI 自动构建发布。
 
 ## License
 

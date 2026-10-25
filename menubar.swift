@@ -7,10 +7,22 @@ let ENGINE_SCRIPT: String = {
     if let bundled = Bundle.main.path(forResource: "ghspeed", ofType: "py") {
         return bundled
     }
-    return NSHomeDirectory() + "/tools/ghspeed/ghspeed.py"
+    for rel in ["/work/ghspeed/ghspeed.py", "/tools/ghspeed/ghspeed.py"] {
+        let p = NSHomeDirectory() + rel
+        if FileManager.default.fileExists(atPath: p) { return p }
+    }
+    return NSHomeDirectory() + "/work/ghspeed/ghspeed.py"
 }()
 let ENGINE_BIN = "/usr/local/bin/ghspeed"
-let APP_BUNDLE = NSHomeDirectory() + "/tools/ghspeed/GHSpeed.app"
+// App 自身位置(从可执行文件路径反推),装在哪开机自启就指向哪
+let APP_BUNDLE: String = {
+    if let exe = Bundle.main.executableURL?.path {
+        var url = URL(fileURLWithPath: exe)
+        for _ in 0..<3 { url.deleteLastPathComponent() } // Contents/MacOS/GHSpeed → *.app
+        if url.pathExtension == "app" { return url.path }
+    }
+    return "/Applications/GHSpeed.app"
+}()
 let HOSTS_MARK = "# >>> ghspeed start >>>"
 
 // ---------------- 进程工具 ----------------
@@ -200,7 +212,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let (on, _) = hostsOn()
         let act = on ? "off" : "on"
         setBusy(true)
-        statusLine.title = act == "on" ? "⏳ 正在开启(约 30 秒测速)…" : "⏳ 正在关闭…"
+        statusLine.title = act == "on" ? "⏳ 正在开启(通常几秒,网络差时约 1 分钟)…" : "⏳ 正在关闭…"
         adminEngine([act]) { ok, out in
             self.setBusy(false)
             if ok {
@@ -215,7 +227,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func refreshNow(_ s: Any) {
         if busy { return }
         setBusy(true)
-        statusLine.title = "⏳ 正在测速(约 30 秒)…"
+        statusLine.title = "⏳ 正在测速(通常几秒)…"
         adminEngine(["refresh"]) { ok, out in
             self.setBusy(false)
             notify("GitHub 加速", ok ? "测速完成,已更新最优 IP ✅" : "测速失败:\(out.suffix(120))")

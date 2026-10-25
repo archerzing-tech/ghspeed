@@ -14,28 +14,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build GHSpeed.app
-        run: ./build_app.sh
+      - name: Build GHSpeed.app + pkg 安装包
+        run: ./make_pkg.sh
 
       - name: Package
         run: |
           cd dist
           zip -qry "GHSpeed-macos-${GITHUB_REF_NAME}.zip" GHSpeed.app
-          ls -lh *.zip
+          ls -lh *.zip *.pkg
 
       - name: Upload artifact (手动触发时)
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: GHSpeed-macos-${{ github.ref_name }}
-          path: dist/*.zip
+          path: |
+            dist/*.zip
+            dist/*.pkg
 
       - name: Create GitHub Release (打 tag 时)
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/*.zip \
+          gh release create "$GITHUB_REF_NAME" dist/*.zip dist/*.pkg \
             --title "$GITHUB_REF_NAME" \
             --notes "## GHSpeed $GITHUB_REF_NAME
 
@@ -43,8 +45,13 @@ jobs:
 
             **当前仅支持 macOS。**
 
-            ### 安装
-            1. 下载下方 \`GHSpeed-macos-*.zip\` 并解压
-            2. 把 \`GHSpeed.app\` 拖到「应用程序」
-            3. 首次打开:右键点击 → 「打开」(绕过 Gatekeeper,应用为 ad-hoc 签名)
-            4. 点菜单栏 🐙 → 「开启加速」,输入一次管理员密码即可"
+            ### 安装(推荐 .pkg 安装包)
+            1. 下载下方 \`GHSpeed-macos-*.pkg\`;若双击被 Gatekeeper 拦截,
+               终端执行 \`xattr -d com.apple.quarantine ~/Downloads/GHSpeed-macos-*.pkg\` 后重新双击
+            2. 继续 → 安装,输入一次管理员密码(装好 /Applications/GHSpeed.app 与命令行 ghspeed)
+            3. 打开 GHSpeed,点菜单栏 🐙 → 「开启加速」
+
+            ### 或 zip 免安装
+            1. 下载 \`GHSpeed-macos-*.zip\` 解压,把 \`GHSpeed.app\` 拖到「应用程序」
+            2. 首次打开:右键点击 → 「打开」(绕过 Gatekeeper,应用为 ad-hoc 签名)
+            3. 点菜单栏 🐙 → 「开启加速」,输入一次管理员密码即可"

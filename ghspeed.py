@@ -123,11 +123,12 @@ def ssl_context():
     return ssl.create_default_context()
 
 
-def save_state(state):
+def save_state(state, dead=None):
     os.makedirs(STATE_DIR, exist_ok=True)
     tmp = STATE_FILE + ".tmp"
     with open(tmp, "w") as f:
-        json.dump({"time": time.time(), "map": state}, f, ensure_ascii=False, indent=1)
+        json.dump({"time": time.time(), "map": state, "dead": dead or {}},
+                  f, ensure_ascii=False, indent=1)
     os.replace(tmp, STATE_FILE)
 
 
@@ -211,56 +212,102 @@ def candidates_for(domain, cap=18):
     return out[:cap]
 
 
-def measure_domain(domain, cands):
-    def one(ip):
-        try:
-            return (ip, probe(domain, ip))
-        except Exception:
-            return (ip, None)
-
-    ok = []
-    with cf.ThreadPoolExecutor(max_workers=16) as ex:
-        for ip, rtt in ex.map(one, cands):
-            if rtt is not None:
-                ok.append((rtt, ip))
-    ok.sort()
-    return ok
+PROBE_TIMEOUT = 2.5   # 好窗口里 TLS 握手 <1s;坏窗口等再久也是白等,收紧
 
 
-def find_best(progress=False):
-    """逐域名测速,返回 {domain: {"ip":..., "rtt_ms":...}}
+def wave(pairs):
+    """并行探测一批 (domain, ip),返回 {domain: (rtt, ip) 中的最优}。
 
-    本地到 GitHub 的链路在好坏窗口间摆动(TCP 通、TLS 被丢是常态,
-    窗口尺度几分钟),单轮快照会误判。失败域名按 3/10/25 秒的
-    间隔跨窗口重试,最多 4 轮,好窗口一到就能测上。
+    所有域名共享一个线程池(旧版逐域名各开一个池再串行排队,
+    13 个域名要等 13 轮);坏 IP 在 PROBE_TIMEOUT 内出局,不拖全局。
     """
-    def attempt(domains):
-        out = {}
-        for d in domains:
-            ranked = measure_domain(d, candidates_for(d))
-            if ranked:
-                out[d] = {"ip": ranked[0][1], "rtt_ms": round(ranked[0][0] * 1000)}
-            if progress:
-                if ranked:
-                    alt = "  ".join("%s %.0fms" % (ip, ms * 1000)
-                                    for ms, ip in ranked[:3])
-                    print("  + %-38s %s" % (d, alt), flush=True)
-                else:
-                    print("  x %-38s 所有候选 IP 均不可达" % d, flush=True)
-        return out
+    out = {}
 
-    state = attempt(DOMAINS)
+    def one(job):
+        d, ip = job
+        try:
+            return (d, ip, probe(d, ip, timeout=PROBE_TIMEOUT))
+        except Exception:
+            return (d, ip, None)
+
+    with cf.ThreadPoolExecutor(max_workers=48) as ex:
+        for d, ip, rtt in ex.map(one, pairs):
+            if rtt is not None and (d not in out or rtt < out[d][0]):
+                out[d] = (rtt, ip)
+    return out
+
+
+def find_best(progress=False, on_round=None):
+    """逐域名测速,返回 {domain: {"ip":..., "rtt_ms":...}}。
+
+    两级加速,解决"开启要等一两分钟":
+    1. 种子轮 —— 上一轮测出的冠军 IP 大概率还活着,先只验这些 IP,
+       全过的话几秒收工,不必全量扫网段;
+    2. 全局波次 —— 种子没过的域名把全部候选 IP 丢进同一个线程池并行测。
+    链路坏窗口(TCP 通、TLS 被丢,几分钟一变)靠 3/10/25 秒间隔的
+    跨窗口重试兜底(阶梯压到 3/8 秒,长坏窗口交给 30 分钟守护去翻盘);on_round 回调在每轮结束拿到当前部分结果,
+    调用方可边测边把已测通的写进 hosts,不必等全部完成。
+    连续全轮失败的域名(本网络硬阻断,如 raw/gist 的 SNI 阻断)
+    记入 state 的 dead 表,之后跳过重试轮,避免每次都白等阶梯。
+    """
+    prev_data = load_state() or {}
+    prev = prev_data.get("map", {})
+    dead = prev_data.get("dead", {})   # 域名 -> 连续全轮失败次数
+
+    def report(done, failed):
+        if not progress:
+            return
+        for d in done:
+            print("  + %-38s %-16s %4d ms"
+                  % (d, state[d]["ip"], state[d]["rtt_ms"]), flush=True)
+        for d in failed:
+            print("  x %-38s 本轮候选 IP 均不可达" % d, flush=True)
+
+    state = {}
+
+    # 种子轮:上一轮的冠军 IP
+    seeds = [(d, prev[d]["ip"]) for d in DOMAINS if prev.get(d, {}).get("ip")]
+    if seeds:
+        r = wave(seeds)
+        for d, (rtt, ip) in r.items():
+            state[d] = {"ip": ip, "rtt_ms": round(rtt * 1000)}
+        report(sorted(r), [d for d, _ in seeds if d not in r])
     pending = [d for d in DOMAINS if d not in state]
-    for pause in (3, 10, 25):
+    if progress and seeds and pending:
+        print("  ... 种子轮通过 %d/%d,全量补测 %d 个 ..."
+              % (len(seeds) - len(pending), len(seeds), len(pending)), flush=True)
+
+    # 全量波次 + 跨窗口重试
+    for pause in (0, 3, 8):
+        if pause:
+            # 上一轮已全败的域名不再浪费跨窗口等待(窗口尺度几分钟,
+            # 短阶梯很少等来翻转);第一波仍会测它们,解禁自然恢复
+            pending = [d for d in pending if dead.get(d, 0) < 1]
         if not pending:
             break
-        if progress:
-            print("  ... 链路抖动,%.0f 秒后跨窗口重试 %d 个域名 ..."
-                  % (pause, len(pending)), flush=True)
-        time.sleep(pause)
-        state.update(attempt(pending))
+        if pause:
+            if progress:
+                print("  ... 链路抖动,%.0f 秒后跨窗口重试 %d 个域名 ..."
+                      % (pause, len(pending)), flush=True)
+            time.sleep(pause)
+        if pending:
+            r = wave([(d, ip) for d in pending for ip in candidates_for(d)])
+            for d, (rtt, ip) in r.items():
+                state[d] = {"ip": ip, "rtt_ms": round(rtt * 1000)}
+            report(sorted(r), [d for d in pending if d not in r])
         pending = [d for d in DOMAINS if d not in state]
-    return state
+        if on_round:
+            on_round(dict(state))
+        if not pending:
+            break
+
+    # 维护"连续全败"计数:测通的清零,全轮失败的 +1(≥2 后跳过重试轮)
+    for d in DOMAINS:
+        if d in state:
+            dead.pop(d, None)
+        else:
+            dead[d] = dead.get(d, 0) + 1
+    return state, dead
 
 
 # ---------------- /etc/hosts ----------------
@@ -398,22 +445,30 @@ def daemon_remove():
 
 def cmd_probe(args):
     print("正在对 %d 个 GitHub 域名测速(不写 hosts)..." % len(DOMAINS))
-    state = find_best(progress=True)
+    state, dead = find_best(progress=True)
     if not state:
         sys.exit("没有任何可用 IP,请检查网络")
-    save_state(state)
+    save_state(state, dead)
     print("\n共 %d/%d 个域名可用,结果已缓存(启用请:sudo ghspeed on)"
           % (len(state), len(DOMAINS)))
 
 
 def cmd_on(args):
     need_root()
-    print("正在测速 GitHub 各域名候选 IP,约需 10~30 秒 ...")
-    state = find_best(progress=True)
+    print("正在测速 GitHub 各域名候选 IP(有缓存时几秒,全量约 20 秒)...")
+
+    def on_round(partial):
+        # 边测边生效:每轮结束把已测通的域名先钉进 hosts,
+        # 用户侧 github.com 早点能用,不必等全部测完
+        if partial:
+            write_hosts(partial)
+            flush_dns()
+
+    state, dead = find_best(progress=True, on_round=on_round)
     if not state:
         sys.exit("没有测到任何可用 IP,本次不做任何修改")
     write_hosts(state)
-    save_state(state)
+    save_state(state, dead)
     daemon_install()
     print("\n已启用:%d/%d 个域名固定到最快 IP" % (len(state), len(DOMAINS)))
     print("  - hosts 备份:%s(首次启用时创建)" % BACKUP_FILE)
@@ -432,11 +487,15 @@ def cmd_off(args):
 
 
 def cmd_refresh(args):
-    state = find_best(progress=not args.quiet)
+    def on_round(partial):
+        if os.geteuid() == 0 and partial:
+            write_hosts(partial)
+
+    state, dead = find_best(progress=not args.quiet, on_round=on_round)
     if not state:
         print("ghspeed: 本次未测到可用 IP,保留现有 hosts 不变")
         return
-    save_state(state)
+    save_state(state, dead)
     if os.geteuid() == 0:
         if current_map_from_hosts() != {d: v["ip"] for d, v in state.items()}:
             write_hosts(state)
