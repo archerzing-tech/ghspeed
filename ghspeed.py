@@ -140,6 +140,30 @@ def load_state():
         return None
 
 
+def load_seeds():
+    """种子缓存:当前身份的 state;root 身份下再回读发起 sudo 的用户缓存,取较新者。
+
+    GUI 启动即测那一轮以用户权限跑,结果落在 ~/.ghspeed/state.json;
+    之后点「开启加速」引擎以 root 运行,只读 /Library 下的 state ——
+    不回读的话启动那轮的成果就浪费了。sudo 把发起者放在 SUDO_USER。
+    """
+    cands = []
+    st = load_state()
+    if st:
+        cands.append(st)
+    if os.geteuid() == 0 and os.environ.get("SUDO_USER", "root") != "root":
+        try:
+            import pwd
+            home = pwd.getpwnam(os.environ["SUDO_USER"]).pw_dir
+            with open(os.path.join(home, ".ghspeed", "state.json")) as f:
+                cands.append(json.load(f))
+        except Exception:
+            pass
+    if not cands:
+        return {}
+    return max(cands, key=lambda d: d.get("time", 0))
+
+
 # ---------------- 测速 ----------------
 
 
@@ -250,7 +274,7 @@ def find_best(progress=False, on_round=None):
     连续全轮失败的域名(本网络硬阻断,如 raw/gist 的 SNI 阻断)
     记入 state 的 dead 表,之后跳过重试轮,避免每次都白等阶梯。
     """
-    prev_data = load_state() or {}
+    prev_data = load_seeds() or {}
     prev = prev_data.get("map", {})
     dead = prev_data.get("dead", {})   # 域名 -> 连续全轮失败次数
 

@@ -80,15 +80,17 @@ func adminEngine(_ args: [String], done: @escaping (Bool, String) -> Void) {
             var argv = [ENGINE_BIN] + args
             var r = runShell(["/usr/bin/sudo", "-n"] + argv, timeout: 600)
             if r.code != 0 && r.out.contains("a password is required") {
-                // 未免密授权 → 弹密码框
-                r = adminShell(argv.joined(separator: " "),
+                // 未免密授权 → 弹密码框;带上 SUDO_USER 让 root 引擎能回读用户侧种子缓存
+                r = adminShell("SUDO_USER=$(/usr/bin/stat -f %Su /dev/console) "
+                               + argv.joined(separator: " "),
                                prompt: "GitHub 加速需要管理员权限(修改 /etc/hosts)")
             }
             ok = r.code == 0; out = r.out
         } else {
             // 引擎还没装到 /usr/local/bin,先 install 再执行目标命令
             let py = "/usr/bin/python3 \(ENGINE_SCRIPT)"
-            let cmd = "\(py) install && \(py) " + args.joined(separator: " ")
+            let cmd = "export SUDO_USER=$(/usr/bin/stat -f %Su /dev/console); "
+                      + "\(py) install && \(py) " + args.joined(separator: " ")
             let r = adminShell(cmd, prompt: "GitHub 加速首次开启:安装命令行并修改 /etc/hosts")
             ok = r.code == 0; out = r.out
         }
@@ -166,6 +168,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshUI()
         timer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
             self?.refreshUI()
+        }
+
+        // 启动即测:不等点「开启加速」,先在后台跑一轮(用户权限,只更新种子缓存,
+        // 不写 hosts、绝不弹密码)。之后点开启/刷新大多走种子轮,几秒收工;
+        // 若已开启且配了免密授权,顺手静默应用一轮,没配就到此为止。
+        DispatchQueue.global().async { [weak self] in
+            _ = runShell(engineUserCmd(["probe"]), timeout: 300)
+            DispatchQueue.main.async {
+                self?.refreshUI()
+                guard let self = self else { return }
+                let (on, _) = hostsOn()
+                if on, FileManager.default.fileExists(atPath: ENGINE_BIN) {
+                    let r = runShell(["/usr/bin/sudo", "-n", ENGINE_BIN, "refresh", "-q"],
+                                     timeout: 300)
+                    if r.code == 0 {
+                        notify("GitHub 加速", "启动测速完成,已自动应用最优 IP")
+                    }
+                    self.refreshUI()
+                }
+            }
         }
     }
 
