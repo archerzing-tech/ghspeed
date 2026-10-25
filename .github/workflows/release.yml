@@ -9,7 +9,8 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  # ---------- macOS:菜单栏 App + pkg ----------
+  build-macos:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -23,35 +24,93 @@ jobs:
           zip -qry "GHSpeed-macos-${GITHUB_REF_NAME}.zip" GHSpeed.app
           ls -lh *.zip *.pkg
 
-      - name: Upload artifact (手动触发时)
-        if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: GHSpeed-macos-${{ github.ref_name }}
+          name: macos
           path: |
             dist/*.zip
             dist/*.pkg
 
-      - name: Create GitHub Release (打 tag 时)
-        if: startsWith(github.ref, 'refs/tags/')
+  # ---------- Linux(Debian):.deb,无 UI ----------
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build .deb
+        run: |
+          V=$(tr -d '[:space:]' < VERSION)
+          mkdir -p pkg/DEBIAN pkg/usr/bin
+          sed "s/@VERSION@/$V/" packaging/deb/control > pkg/DEBIAN/control
+          cp ghspeed.py pkg/usr/bin/ghspeed
+          chmod 755 pkg/usr/bin/ghspeed
+          dpkg-deb --build --root-owner-group pkg "ghspeed_${V}_all.deb"
+          ls -lh *.deb
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: ghspeed_*_all.deb
+
+  # ---------- Windows 10+:CLI + tkinter 简易界面 ----------
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path stage\GHSpeed | Out-Null
+          Copy-Item ghspeed.py, ghspeed_gui.pyw, ghspeed.bat, README.md stage\GHSpeed\
+          $v = (Get-Content VERSION -Raw).Trim()
+          Compress-Archive -Path stage\GHSpeed -DestinationPath "GHSpeed-windows-${{ github.ref_name }}.zip"
+          Get-ChildItem *.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: GHSpeed-windows-*.zip
+
+  # ---------- 汇总发布(打 tag 时)----------
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build-macos, build-linux, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/*.zip dist/*.pkg \
-            --title "$GITHUB_REF_NAME" \
-            --notes "## GHSpeed $GITHUB_REF_NAME
+          FILES=$(find artifacts -type f \( -name "*.pkg" -o -name "*.zip" -o -name "*.deb" \) | tr '\n' ' ')
+          echo "发布文件: $FILES"
+          cat > notes.md <<'EOF'
+          ## GHSpeed ${{ github.ref_name }}
 
-            macOS 专用 GitHub 加速工具:菜单栏一键开关,IP 测速固定 + 镜像加速下载。
+          GitHub 专用加速工具:测速固定最快 IP 到 hosts + 镜像加速下载。只碰 GitHub,不碰其他网络。
 
-            **当前仅支持 macOS。**
+          ### macOS(菜单栏 🐙)
+          1. 下载 `GHSpeed-macos-*.pkg` 双击安装;被 Gatekeeper 拦截就先
+             `xattr -d com.apple.quarantine ~/Downloads/GHSpeed-macos-*.pkg`
+          2. 点菜单栏 🐙 → 「开启加速」(或用 `GHSpeed-macos-*.zip` 免安装)
 
-            ### 安装(推荐 .pkg 安装包)
-            1. 下载下方 \`GHSpeed-macos-*.pkg\`;若双击被 Gatekeeper 拦截,
-               终端执行 \`xattr -d com.apple.quarantine ~/Downloads/GHSpeed-macos-*.pkg\` 后重新双击
-            2. 继续 → 安装,输入一次管理员密码(装好 /Applications/GHSpeed.app 与命令行 ghspeed)
-            3. 打开 GHSpeed,点菜单栏 🐙 → 「开启加速」
+          ### Windows 10+(简易界面)
+          1. 先装 [Python 3](https://www.python.org/downloads/)(勾选 Add to PATH)
+          2. 解压 `GHSpeed-windows-*.zip`,双击 `GHSpeed_gui.pyw`(或命令行 `ghspeed.bat`)
+          3. 点「开启加速」,UAC 弹窗选「是」(需管理员改 hosts + 建计划任务)
 
-            ### 或 zip 免安装
-            1. 下载 \`GHSpeed-macos-*.zip\` 解压,把 \`GHSpeed.app\` 拖到「应用程序」
-            2. 首次打开:右键点击 → 「打开」(绕过 Gatekeeper,应用为 ad-hoc 签名)
-            3. 点菜单栏 🐙 → 「开启加速」,输入一次管理员密码即可"
+          ### Linux / Debian(命令行,无 UI)
+          ```
+          sudo dpkg -i ghspeed_*_all.deb
+          sudo ghspeed on     # 关闭:sudo ghspeed off
+          ```
+          开启后自动装 systemd 定时器,每 30 分钟重测刷新。
+          EOF
+          gh release create "$GITHUB_REF_NAME" $FILES \
+            --title "$GITHUB_REF_NAME" --notes-file notes.md

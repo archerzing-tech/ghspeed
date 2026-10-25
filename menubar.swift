@@ -25,6 +25,17 @@ let APP_BUNDLE: String = {
 }()
 let HOSTS_MARK = "# >>> ghspeed start >>>"
 
+// 版本号:打包后读 Info.plist;开发态退回仓库 VERSION 文件
+let APP_VERSION: String = {
+    if let v = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString")
+        as? String, !v.isEmpty { return v }
+    if let v = try? String(contentsOfFile: NSHomeDirectory() + "/work/ghspeed/VERSION",
+                           encoding: .utf8) {
+        return v.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    return "dev"
+}()
+
 // ---------------- 进程工具 ----------------
 
 func runShell(_ argv: [String], timeout: TimeInterval) -> (code: Int32, out: String) {
@@ -162,6 +173,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         downloadItem = addItem("⬇️ 下载剪贴板中的 GitHub 链接", #selector(downloadClip))
         menu.addItem(.separator())
         autostartItem = addItem("开机自启", #selector(toggleAutostart))
+        addItem("关于 GHSpeed", #selector(about))
         addItem("退出", #selector(quit))
         actionItems = [toggleItem, refreshItem, mirrorsItem, downloadItem, autostartItem]
 
@@ -363,6 +375,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             notify("GitHub 加速", "已设置开机自启")
         }
         refreshUI()
+    }
+
+    @objc func about(_ s: Any) {
+        showTextDialog(
+            "🐙 GHSpeed v\(APP_VERSION)\n\n"
+            + "GitHub 专用加速工具 —— 只碰 GitHub,不碰其他网络\n\n"
+            + "github.com/archerzing-tech/ghspeed\n\n"
+            + "macOS 菜单栏应用 · 引擎 ghspeed.py\n"
+            + "Windows(tkinter 界面)与 Linux(命令行)版本见仓库 Releases",
+            title: "关于 GHSpeed")
     }
 
     @objc func quit(_ s: Any) { NSApp.terminate(nil) }

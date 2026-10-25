@@ -1,8 +1,12 @@
 # GHSpeed 🐙
 
-macOS 专用 GitHub 加速工具:菜单栏一键开关,只解决 GitHub 的问题,不碰其他任何网络。
+GitHub 加速工具:测速固定最快 IP + 镜像加速下载,只解决 GitHub 的问题,不碰其他任何网络。
 
-> **当前仅支持 macOS。** 其他平台暂不考虑。
+| 平台 | 界面 | 最低要求 |
+|---|---|---|
+| macOS | 菜单栏 🐙 | 10.13+ |
+| Windows | tkinter 简易窗口 + 命令行 | Windows 10+,Python 3 |
+| Linux(Debian 系) | 命令行(无 UI) | Python 3,systemd |
 
 ## 截图
 
@@ -12,9 +16,11 @@ macOS 专用 GitHub 加速工具:菜单栏一键开关,只解决 GitHub 的问�
 
 ## 它解决什么
 
-1. **加快访问 github** — 并发探测已知 GitHub 网段 + DoH 解析结果,按域名做 TLS 握手测速(证书验证防污染 IP),把最快 IP 写入 `/etc/hosts` 标记块,launchd 每 30 分钟自动重测换优
+1. **加快访问 github** — 并发探测已知 GitHub 网段 + DoH 解析结果,按域名做 TLS 握手测速(证书验证防污染 IP),把最快 IP 写入 hosts 标记块,并装定时任务每 30 分钟自动重测换优
 2. **加速 GitHub 下载** — ghproxy 系镜像回退链 + 直连兜底,停滞/低速自动换通道,支持 Range 断点续传
 3. **打不开变能打开** — 链路在好坏窗口间摆动(TCP 通、TLS 间歇被丢)时,测速器跨窗口多轮重试,好窗口一到就把 IP 钉住
+
+三平台同一份 Python 引擎(`ghspeed.py`),hosts / 定时刷新 / DNS 缓存 / 提权方式按平台自动适配(launchd / systemd / 计划任务)。
 
 ## 安装
 
@@ -43,6 +49,24 @@ git clone https://github.com/archerzing-tech/ghspeed.git
 cd ghspeed && sudo ./install.sh && sudo ghspeed on
 ```
 
+### Windows 10+(简易界面)
+
+1. 先装 [Python 3](https://www.python.org/downloads/)(安装时勾选 **Add to PATH**)
+2. 下载 `GHSpeed-windows-*.zip` 解压,**双击 `GHSpeed_gui.pyw`** 打开界面(无黑窗口)
+3. 点「开启加速」→ UAC 弹窗选「是」,完成(需要管理员改 hosts + 建计划任务)
+
+命令行(管理员 PowerShell/CMD):`python ghspeed.py on` / `off` / `status`,或双击 `ghspeed.bat`。
+
+### Linux / Debian(命令行,无 UI)
+
+```bash
+sudo dpkg -i ghspeed_*_all.deb   # 或 apt install ./ghspeed_*_all.deb
+sudo ghspeed on                  # 测速 + 固定 hosts + 装 systemd 定时器
+sudo ghspeed off                 # 完全还原
+```
+
+依赖仅 `python3`;开启后自动安装 `ghspeed-refresh.timer`(每 30 分钟重测),`off` 时移除。
+
 ## 使用
 
 ### 菜单栏(推荐)
@@ -57,6 +81,7 @@ cd ghspeed && sudo ./install.sh && sudo ghspeed on
 | 镜像检测… | 并发探测各镜像健康度与延迟 |
 | ⬇️ 下载剪贴板中的 GitHub 链接 | 复制链接 → 点一下,图标显示 `⬇️ xx%`,完成后弹通知,文件落在「下载」 |
 | 开机自启 | 用户级 LaunchAgent,无需管理员 |
+| 关于 GHSpeed | 显示版本号与项目地址 |
 
 **启动即测**:应用一启动就在后台先跑一轮测速(用户权限,不写 hosts、不弹密码),结果存入种子缓存——之后点「开启加速」或「立即测速刷新」大多直接走种子轮,几秒完成。若当时已开启加速且配好了免密授权,启动测完还会自动把更优 IP 应用上,无需任何点击。
 
@@ -106,10 +131,12 @@ GHSPEED_MIRRORS="https://your-mirror.example.com/" ghspeed dl <url>
 ## 构建
 
 ```bash
-./make_pkg.sh        # 产出 dist/GHSpeed-macos-*.pkg + GHSpeed.app(需 Xcode CLT 的 swiftc)
+./make_pkg.sh        # macOS:dist/GHSpeed-macos-*.pkg + GHSpeed.app(需 Xcode CLT 的 swiftc)
 ```
 
-App 自包含 `ghspeed.py` 引擎;打 `v*` 标签推送后 CI 自动构建发布。
+Linux `.deb` 与 Windows `.zip` 由 CI(打 `v*` 标签)构建,脚本见 `.github/workflows/release.yml`;Windows 界面为标准库 tkinter,无需额外依赖。
+
+App 自包含 `ghspeed.py` 引擎;三平台共用同一引擎文件。
 
 ## License
 

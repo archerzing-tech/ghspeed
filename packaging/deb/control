@@ -1,0 +1,13 @@
+Package: ghspeed
+Version: @VERSION@
+Section: net
+Priority: optional
+Architecture: all
+Depends: python3
+Maintainer: archerzing-tech <archerzing-tech@users.noreply.github.com>
+Description: GitHub 专用加速工具
+ 并发 TLS 测速选出最快 GitHub IP 固定到 /etc/hosts,
+ systemd 定时重测刷新;只碰 GitHub,不碰其他网络。
+ 命令行界面(无 GUI):sudo ghspeed on 开启,sudo ghspeed off 关闭。
+ .
+ https://github.com/archerzing-tech/ghspeed

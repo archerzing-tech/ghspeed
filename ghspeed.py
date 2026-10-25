@@ -33,19 +33,55 @@ from urllib.parse import urlparse, unquote
 
 # ---------------- 常量 ----------------
 
-HOSTS_FILE = "/etc/hosts"
-BACKUP_FILE = "/etc/hosts.ghspeed.bak"
+import platform as _platform
+
+IS_MAC = _platform.system() == "Darwin"
+IS_WIN = _platform.system() == "Windows"
+
+if IS_WIN:
+    import ctypes
+
+    def is_admin():
+        try:
+            return ctypes.windll.shell32.IsUserAnAdmin() != 0
+        except Exception:
+            return False
+    HOSTS_FILE = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                              "System32", "drivers", "etc", "hosts")
+    BACKUP_FILE = HOSTS_FILE + ".ghspeed.bak"
+    STATE_DIR = (os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"),
+                              "ghspeed") if is_admin()
+                 else os.path.join(os.path.expanduser("~"), ".ghspeed"))
+else:
+    def is_admin():
+        return os.geteuid() == 0
+    HOSTS_FILE = "/etc/hosts"
+    BACKUP_FILE = "/etc/hosts.ghspeed.bak"
+    if os.geteuid() == 0:
+        STATE_DIR = ("/Library/Application Support/ghspeed" if IS_MAC
+                     else "/var/lib/ghspeed")
+    else:
+        STATE_DIR = os.path.expanduser("~/.ghspeed")
+STATE_FILE = os.path.join(STATE_DIR, "state.json")
+
 MARK_S = "# >>> ghspeed start >>>"
 MARK_E = "# <<< ghspeed end <<<"
 
-STATE_DIR = ("/Library/Application Support/ghspeed" if os.geteuid() == 0
-             else os.path.expanduser("~/.ghspeed"))
-STATE_FILE = os.path.join(STATE_DIR, "state.json")
-
 PLIST_LABEL = "com.ghspeed.refresh"
 PLIST_PATH = "/Library/LaunchDaemons/%s.plist" % PLIST_LABEL
+SYSTEMD_SERVICE = "/etc/systemd/system/ghspeed-refresh.service"
+SYSTEMD_TIMER = "/etc/systemd/system/ghspeed-refresh.timer"
+WIN_TASK = "GHSpeed-Refresh"
 LOG_FILE = "/var/log/ghspeed.log"
 REFRESH_INTERVAL = 1800  # 秒
+
+# 版本:优先读仓库旁的 VERSION 文件,安装后的散装副本用内置值兜底
+try:
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "VERSION")) as _f:
+        __version__ = _f.read().strip() or "0.1.0"
+except Exception:
+    __version__ = "0.1.0"
 
 # 只处理这些 GitHub 域名,一个都不多
 DOMAINS = [
@@ -95,7 +131,11 @@ UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X) ghspeed/1.0"
 
 
 def need_root():
-    if os.geteuid() != 0:
+    if not is_admin():
+        if IS_WIN:
+            sys.exit("需要管理员权限:请在「以管理员身份运行」的终端里执行:  "
+                     "python ghspeed.py %s"
+                     % (sys.argv[1] if len(sys.argv) > 1 else "on"))
         sys.exit("需要 root 权限,请用 sudo 运行,例如:  sudo ghspeed %s"
                  % (sys.argv[1] if len(sys.argv) > 1 else "on"))
 
@@ -151,7 +191,7 @@ def load_seeds():
     st = load_state()
     if st:
         cands.append(st)
-    if os.geteuid() == 0 and os.environ.get("SUDO_USER", "root") != "root":
+    if is_admin() and os.environ.get("SUDO_USER", "root") != "root":
         try:
             import pwd
             home = pwd.getpwnam(os.environ["SUDO_USER"]).pw_dir
@@ -338,8 +378,8 @@ def find_best(progress=False, on_round=None):
 
 
 def hosts_block(state):
-    lines = [MARK_S,
-             "# ghspeed 自动生成,勿手改;sudo ghspeed off 可整体移除"]
+    hint = "ghspeed off 可整体移除" if IS_WIN else "sudo ghspeed off 可整体移除"
+    lines = [MARK_S, "# ghspeed 自动生成,勿手改;" + hint]
     for d in sorted(state):
         lines.append("%s %s" % (state[d]["ip"], d))
     lines.append(MARK_E)
@@ -347,7 +387,7 @@ def hosts_block(state):
 
 
 def read_hosts():
-    with open(HOSTS_FILE) as f:
+    with open(HOSTS_FILE, encoding="utf-8", errors="replace") as f:
         return f.read()
 
 
@@ -372,8 +412,18 @@ def current_map_from_hosts():
 
 
 def flush_dns():
-    subprocess.run(["dscacheutil", "-flushcache"], check=False)
-    subprocess.run(["killall", "-HUP", "mDNSResponder"], check=False)
+    if IS_WIN:
+        subprocess.run(["ipconfig", "/flushdns"], check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    elif IS_MAC:
+        subprocess.run(["dscacheutil", "-flushcache"], check=False)
+        subprocess.run(["killall", "-HUP", "mDNSResponder"], check=False)
+    else:
+        # systemd-resolved 的两种入口,有哪个用哪个,都没有就无所谓
+        subprocess.run(["resolvectl", "flush-caches"], check=False,
+                       capture_output=True)
+        subprocess.run(["systemd-resolve", "--flush-caches"], check=False,
+                       capture_output=True)
 
 
 def write_hosts(state):
@@ -391,7 +441,7 @@ def write_hosts(state):
             os.chmod(BACKUP_FILE, 0o644)
         text += "\n" + block
     tmp = HOSTS_FILE + ".ghspeed.tmp"
-    with open(tmp, "w") as f:
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
         f.write(text)
     os.chmod(tmp, 0o644)
     os.replace(tmp, HOSTS_FILE)
@@ -404,7 +454,7 @@ def remove_hosts():
         text = re.sub(re.escape(MARK_S) + r".*?" + re.escape(MARK_E) + r"\n?",
                       "", text, flags=re.S)
         tmp = HOSTS_FILE + ".ghspeed.tmp"
-        with open(tmp, "w") as f:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
             f.write(text)
         os.chmod(tmp, 0o644)
         os.replace(tmp, HOSTS_FILE)
@@ -413,7 +463,7 @@ def remove_hosts():
     return False
 
 
-# ---------------- launchd 定时刷新 ----------------
+# ---------------- 定时刷新守护(macOS launchd / Linux systemd / Windows schtasks)----------------
 
 PLIST_TMPL = """<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -435,33 +485,96 @@ PLIST_TMPL = """<?xml version="1.0" encoding="UTF-8"?>
 </plist>
 """
 
+SYSTEMD_SERVICE_TMPL = """[Unit]
+Description=GHSpeed GitHub hosts 定时刷新
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%(exe)s %(script)s refresh --quiet
+Nice=10
+"""
+
+SYSTEMD_TIMER_TMPL = """[Unit]
+Description=GHSpeed 每 %(minutes)d 分钟重测 GitHub 最优 IP
+
+[Timer]
+OnBootSec=2min
+OnCalendar=*:0/%(minutes)d
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+"""
+
 
 def daemon_install():
-    body = PLIST_TMPL % {"label": PLIST_LABEL,
-                         "exe": sys.executable,
-                         "script": os.path.realpath(__file__),
-                         "interval": REFRESH_INTERVAL,
-                         "log": LOG_FILE}
-    with open(PLIST_PATH, "w") as f:
-        f.write(body)
-    os.chmod(PLIST_PATH, 0o644)
-    shutil.chown(PLIST_PATH, "root", "wheel")
-    subprocess.run(["launchctl", "bootout", "system/" + PLIST_LABEL],
-                   capture_output=True)
-    r = subprocess.run(["launchctl", "bootstrap", "system", PLIST_PATH],
-                       capture_output=True, text=True)
-    if r.returncode != 0:  # 旧系统兜底
-        subprocess.run(["launchctl", "load", "-w", PLIST_PATH], check=False)
+    exe, script, minutes = sys.executable, os.path.realpath(__file__), REFRESH_INTERVAL // 60
+    if IS_WIN:
+        # SYSTEM 账号自带管理员权限;TR 内层引号由 schtasks 约定为 \"
+        tr = '\\"%s\\" \\"%s\\" refresh --quiet' % (exe, script)
+        subprocess.run(["schtasks", "/Create", "/F", "/RU", "SYSTEM",
+                        "/SC", "MINUTE", "/MO", str(minutes),
+                        "/TN", WIN_TASK, "/TR", tr],
+                       check=False, capture_output=True)
+    elif IS_MAC:
+        body = PLIST_TMPL % {"label": PLIST_LABEL, "exe": exe,
+                             "script": script, "interval": REFRESH_INTERVAL,
+                             "log": LOG_FILE}
+        with open(PLIST_PATH, "w") as f:
+            f.write(body)
+        os.chmod(PLIST_PATH, 0o644)
+        shutil.chown(PLIST_PATH, "root", "wheel")
+        subprocess.run(["launchctl", "bootout", "system/" + PLIST_LABEL],
+                       capture_output=True)
+        r = subprocess.run(["launchctl", "bootstrap", "system", PLIST_PATH],
+                           capture_output=True, text=True)
+        if r.returncode != 0:  # 旧系统兜底
+            subprocess.run(["launchctl", "load", "-w", PLIST_PATH], check=False)
+    else:
+        for path, body in (
+                (SYSTEMD_SERVICE, SYSTEMD_SERVICE_TMPL % {"exe": exe, "script": script}),
+                (SYSTEMD_TIMER, SYSTEMD_TIMER_TMPL % {"minutes": minutes})):
+            with open(path, "w") as f:
+                f.write(body)
+            os.chmod(path, 0o644)
+        subprocess.run(["systemctl", "daemon-reload"], check=False, capture_output=True)
+        subprocess.run(["systemctl", "enable", "--now", "ghspeed-refresh.timer"],
+                       check=False, capture_output=True)
 
 
 def daemon_remove():
-    subprocess.run(["launchctl", "bootout", "system/" + PLIST_LABEL],
-                   capture_output=True)
-    subprocess.run(["launchctl", "unload", "-w", PLIST_PATH], capture_output=True)
-    try:
-        os.remove(PLIST_PATH)
-    except FileNotFoundError:
-        pass
+    if IS_WIN:
+        subprocess.run(["schtasks", "/Delete", "/F", "/TN", WIN_TASK],
+                       check=False, capture_output=True)
+    elif IS_MAC:
+        subprocess.run(["launchctl", "bootout", "system/" + PLIST_LABEL],
+                       capture_output=True)
+        subprocess.run(["launchctl", "unload", "-w", PLIST_PATH], capture_output=True)
+        try:
+            os.remove(PLIST_PATH)
+        except FileNotFoundError:
+            pass
+    else:
+        subprocess.run(["systemctl", "disable", "--now", "ghspeed-refresh.timer"],
+                       check=False, capture_output=True)
+        for path in (SYSTEMD_SERVICE, SYSTEMD_TIMER):
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+        subprocess.run(["systemctl", "daemon-reload"], check=False, capture_output=True)
+
+
+def daemon_installed():
+    if IS_WIN:
+        return subprocess.run(["schtasks", "/Query", "/TN", WIN_TASK],
+                              check=False, capture_output=True).returncode == 0
+    if IS_MAC:
+        return os.path.exists(PLIST_PATH)
+    return os.path.exists(SYSTEMD_TIMER)
 
 
 # ---------------- 子命令 ----------------
@@ -512,7 +625,7 @@ def cmd_off(args):
 
 def cmd_refresh(args):
     def on_round(partial):
-        if os.geteuid() == 0 and partial:
+        if is_admin() and partial:
             write_hosts(partial)
 
     state, dead = find_best(progress=not args.quiet, on_round=on_round)
@@ -520,7 +633,7 @@ def cmd_refresh(args):
         print("ghspeed: 本次未测到可用 IP,保留现有 hosts 不变")
         return
     save_state(state, dead)
-    if os.geteuid() == 0:
+    if is_admin():
         if current_map_from_hosts() != {d: v["ip"] for d, v in state.items()}:
             write_hosts(state)
             print("ghspeed: 刷新完成,%d 个域名已更新" % len(state))
@@ -545,9 +658,9 @@ def cmd_status(args):
         in_hosts = current_map_from_hosts()
     except Exception:
         in_hosts = {}
-    print("\n/etc/hosts:%s" % (
-        "已写入 %d 个 GitHub 域名" % len(in_hosts) if in_hosts else "未启用(运行 sudo ghspeed on)"))
-    print("定时刷新:%s" % ("已安装" if os.path.exists(PLIST_PATH) else "未安装"))
+    print("\n%s:%s" % (HOSTS_FILE,
+        "已写入 %d 个 GitHub 域名" % len(in_hosts) if in_hosts else "未启用(运行 sudo ghspeed on)" if not IS_WIN else "未启用(管理员终端运行 ghspeed on)"))
+    print("定时刷新:%s" % ("已安装" if daemon_installed() else "未安装"))
 
     try:
         ips = socket.getaddrinfo("github.com", 443, socket.AF_INET,
@@ -718,17 +831,32 @@ def cmd_git(args):
 def cmd_install(args):
     need_root()
     src = os.path.realpath(__file__)
-    os.makedirs("/usr/local/bin", exist_ok=True)
-    dst = "/usr/local/bin/ghspeed"
-    shutil.copy2(src, dst)
-    os.chmod(dst, 0o755)
-    print("已安装到 %s,以后直接用 ghspeed 命令" % dst)
-    print("下一步:  sudo ghspeed on")
+    if IS_WIN:
+        dst_dir = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"),
+                               "ghspeed")
+        os.makedirs(dst_dir, exist_ok=True)
+        dst = os.path.join(dst_dir, "ghspeed.py")
+        shutil.copy2(src, dst)
+        bat = os.path.join(dst_dir, "ghspeed.bat")
+        with open(bat, "w", encoding="ascii") as f:
+            f.write('@echo off\r\npython "%s" %%*\r\n' % dst)
+        print("已安装到 %s" % dst_dir)
+        print("如需任意位置直接敲 ghspeed,把该目录加入 PATH(可选)")
+        print("下一步(管理员终端):  ghspeed on")
+    else:
+        os.makedirs("/usr/local/bin", exist_ok=True)
+        dst = "/usr/local/bin/ghspeed"
+        shutil.copy2(src, dst)
+        os.chmod(dst, 0o755)
+        print("已安装到 %s,以后直接用 ghspeed 命令" % dst)
+        print("下一步:  sudo ghspeed on")
 
 
 def main():
     ap = argparse.ArgumentParser(
         prog="ghspeed", description="GitHub 专用加速工具(只碰 GitHub,不碰其他网络)")
+    ap.add_argument("--version", action="version",
+                    version="ghspeed " + __version__ + " (macOS/Windows/Linux)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("on", help="启用:测速 + 固定最快 IP 到 hosts + 装定时刷新(root)").set_defaults(func=cmd_on)
