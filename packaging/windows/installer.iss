@@ -52,7 +52,8 @@ begin
   if (CurStep = ssPostInstall) and WizardIsTaskSelected('addpath') then
   begin
     AppDir := ExpandConstant('{app}');
-    RegGetString(HKEY_CURRENT_USER, 'Environment\Path', P);
+    P := '';
+    RegQueryStringValue(HKEY_CURRENT_USER, 'Environment', 'Path', P);
     if Pos(';' + Uppercase(AppDir) + ';', ';' + Uppercase(P) + ';') = 0 then
     begin
       if P <> '' then
@@ -72,7 +73,7 @@ begin
   begin
     // 从用户 PATH 里摘掉安装目录(手动按 ';' 分割,Pascal Script 无 Split)
     AppDir := ExpandConstant('{app}');
-    if RegGetString(HKEY_CURRENT_USER, 'Environment\Path', P) then
+    if RegQueryStringValue(HKEY_CURRENT_USER, 'Environment', 'Path', P) then
     begin
       Removed := '';
       while Length(P) > 0 do
