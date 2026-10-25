@@ -79,9 +79,9 @@ REFRESH_INTERVAL = 1800  # 秒
 try:
     with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "VERSION")) as _f:
-        __version__ = _f.read().strip() or "0.2.0"
+        __version__ = _f.read().strip() or "0.2.1"
 except Exception:
-    __version__ = "0.2.0"
+    __version__ = "0.2.1"
 
 # 只处理这些 GitHub 域名,一个都不多
 DOMAINS = [
@@ -913,6 +913,14 @@ def main():
     p.add_argument("--mirror", help="指定镜像前缀")
     p.set_defaults(func=cmd_git)
 
+    if IS_WIN and len(sys.argv) == 1:
+        # 双击 ghspeed.exe 时别让黑窗一闪而过:打印帮助后等回车
+        try:
+            ap.print_help()
+            input("\n按回车键退出…")
+        except Exception:
+            pass
+        return
     args = ap.parse_args()
     args.func(args)
 

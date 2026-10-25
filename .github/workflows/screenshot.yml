@@ -16,6 +16,9 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install deps
+        run: pip install pystray pillow
+
       - name: Render + capture
         run: python packaging/windows/screenshot.py packaging/windows/win_ui.png
 

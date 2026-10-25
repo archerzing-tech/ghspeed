@@ -62,11 +62,13 @@ cd ghspeed && sudo ./install.sh && sudo ghspeed on
 1. 下载 `GHSpeed-windows-setup-*.exe` 双击安装(可选桌面快捷方式、加入 PATH)
 2. 未做代码签名:SmartScreen 若拦截,点「更多信息」→「仍要运行」
 3. 打开 GHSpeed → 「开启加速」→ UAC 弹窗选「是」,完成
+4. 关闭窗口=最小化到任务栏托盘 🐙(双击托盘图标回到窗口,右键托盘菜单可退出)
    (卸载前建议以管理员运行 `ghspeed off` 还原 hosts 与计划任务,卸载器结束时会再提醒)
 
 **方式二:便携 zip**
 
 解压 `GHSpeed-windows-*.zip`,双击 `GHSpeed.exe`(运行时已内置,同样免装 Python)。
+注意:小写的 `ghspeed.exe` 是命令行版,双击只弹一个黑窗(打印帮助后按回车退出);图形界面请认准大写 `GHSpeed.exe`。
 
 **方式三:源码运行**(已有 Python 3 环境时)
 
@@ -102,7 +104,7 @@ sudo ghspeed off                 # 完全还原
 
 ### Windows 简易界面
 
-双击 `GHSpeed_gui.pyw` 打开,按钮与 macOS 菜单一一对应:开启/关闭加速、立即测速刷新、镜像检测(结果直接显示在窗口里)、关于(版本号)。开启加速时弹 UAC 授权,提权后自动把开启做完。
+双击 `GHSpeed_gui.pyw` 打开,按钮与 macOS 菜单一一对应:开启/关闭加速、立即测速刷新、镜像检测(结果直接显示在窗口里)、关于(版本号)。开启加速时弹 UAC 授权,提权后自动把开启做完。窗口关闭时最小化到系统托盘(装了 `pystray` 时),右键托盘图标退出。
 
 ### 命令行(三平台通用)
 

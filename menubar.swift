@@ -123,18 +123,23 @@ func hostsOn() -> (on: Bool, count: Int) {
 
 // 实测 github.com 延迟(HEAD,4 秒超时);返回毫秒,-1 不通
 func measureLatency() -> Int {
-    let sem = DispatchSemaphore(value: 0)
-    var ms = -1
-    var req = URLRequest(url: URL(string: "https://github.com")!)
-    req.httpMethod = "HEAD"
-    req.timeoutInterval = 4
-    let t0 = Date()
-    URLSession.shared.dataTask(with: req) { _, _, err in
-        if err == nil { ms = Int(Date().timeIntervalSince(t0) * 1000) }
-        sem.signal()
-    }.resume()
-    _ = sem.wait(timeout: .now() + 5)
-    return ms
+    // 连探两次:偶发丢一发就报"链路波动"太冤枉,失败后隔 1 秒再试
+    for attempt in 0..<2 {
+        let sem = DispatchSemaphore(value: 0)
+        var ms = -1
+        var req = URLRequest(url: URL(string: "https://github.com")!)
+        req.httpMethod = "HEAD"
+        req.timeoutInterval = 4
+        let t0 = Date()
+        URLSession.shared.dataTask(with: req) { _, _, err in
+            if err == nil { ms = Int(Date().timeIntervalSince(t0) * 1000) }
+            sem.signal()
+        }.resume()
+        _ = sem.wait(timeout: .now() + 5)
+        if ms >= 0 || attempt == 1 { return ms }
+        Thread.sleep(forTimeInterval: 1)
+    }
+    return -1
 }
 
 // ---------------- 主应用 ----------------
@@ -179,7 +184,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         actionItems = [toggleItem, refreshItem, mirrorsItem, downloadItem, autostartItem]
 
         refreshUI()
-        timer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: 120, repeats: true) { [weak self] _ in
             self?.refreshUI()
         }
 
@@ -239,9 +244,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    // 已开启但 github.com 不通 → 免密可用就静默重测钉新 IP(10 分钟最多一次)
+    // 已开启但 github.com 不通 → 免密可用就静默重测钉新 IP(5 分钟最多一次)
     func autoHealIfNeeded() {
-        guard Date().timeIntervalSince(lastHeal) > 600,
+        guard Date().timeIntervalSince(lastHeal) > 300,
               FileManager.default.fileExists(atPath: ENGINE_BIN) else { return }
         lastHeal = Date()
         DispatchQueue.global().async { [weak self] in

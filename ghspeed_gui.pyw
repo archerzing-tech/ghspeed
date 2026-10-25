@@ -7,6 +7,7 @@ import socket
 import sys
 import threading
 import time
+import traceback
 import tkinter as tk
 from tkinter import messagebox
 from tkinter.scrolledtext import ScrolledText
@@ -54,6 +55,8 @@ class App:
         self.out.pack(fill="both", expand=True, padx=14, pady=(2, 12))
 
         self.busy = False
+        self.tray = None            # 托盘图标(pystray),main() 里装配
+        self.hide_hint_shown = False
         self.refresh_ui()
         if "--elevated-on" in sys.argv:  # UAC 提权重启后自动开启
             self.root.after(300, self.toggle)
@@ -122,7 +125,7 @@ class App:
         rc = ctypes.windll.shell32.ShellExecuteW(None, "runas",
                                                  target, params, None, 1)
         if rc > 32:
-            self.root.destroy()
+            self.quit_app()
         else:
             messagebox.showwarning(APP, "未获得管理员授权,无法修改 hosts")
 
@@ -194,6 +197,7 @@ class App:
             "🐙 GHSpeed v%s\n\nGitHub 专用加速工具 —— 只碰 GitHub,不碰其他网络\n\n"
             "github.com/archerzing-tech/ghspeed\n\n"
             "Windows 简易界面 · 引擎 ghspeed.py\n"
+            "关闭窗口=最小化到托盘;右键托盘图标可退出\n"
             "开启加速需管理员授权(修改 hosts + 计划任务)" % eng.__version__)
 
     def run_bg(self, msg, fn, ok_msg, err_prefix):
@@ -219,6 +223,79 @@ class App:
         self.refresh_ui()
 
 
+    # ---------------- 窗口/托盘 ----------------
+
+    def show_window(self):
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+
+    def hide_to_tray(self):
+        self.root.withdraw()
+        if not self.hide_hint_shown:
+            self.hide_hint_shown = True
+            tip = ("已最小化到系统托盘 🐙(任务栏右下角)。\n"
+                   "双击托盘图标重新打开;右键托盘图标可退出。"
+                   if self.tray is not None else
+                   "窗口已关闭,后台定时刷新仍在运行。\n再次打开 GHSpeed.exe 可回到窗口。")
+            messagebox.showinfo(APP, tip)
+
+    def quit_app(self):
+        if self.tray is not None:
+            try:
+                self.tray.stop()
+            except Exception:
+                pass
+        self.root.destroy()
+
+
+def _tray_image():
+    """托盘 🐙 图:冻结环境在 _MEIPASS,源码运行在仓库 icons/"""
+    try:
+        from PIL import Image
+    except Exception:
+        return None
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    for p in (os.path.join(base, "icons", "icon_1024.png"),
+              os.path.join(base, "icon_1024.png")):
+        if os.path.exists(p):
+            try:
+                with Image.open(p) as im:
+                    return im.convert("RGBA").resize((64, 64))
+            except Exception:
+                return None
+    return None
+
+
+def setup_tray(app):
+    """常驻系统托盘;pystray 缺席(源码零依赖模式)就退回纯窗口"""
+    try:
+        import pystray
+    except Exception:
+        return None
+    img = _tray_image()
+    if img is None:
+        return None
+    root = app.root
+
+    def handler(fn):
+        return lambda ic, it: root.after(0, fn)
+
+    menu = pystray.Menu(
+        pystray.Item("显示主窗口", handler(app.show_window), default=True),
+        pystray.Menu.SEPARATOR,
+        pystray.Item("开启/关闭加速", handler(app.toggle)),
+        pystray.Item("立即测速刷新", handler(app.refresh_now)),
+        pystray.Item("镜像检测", handler(app.check_mirrors)),
+        pystray.Menu.SEPARATOR,
+        pystray.Item("关于", handler(app.about)),
+        pystray.Item("退出", handler(app.quit_app)),
+    )
+    icon = pystray.Icon(APP, img, "GHSpeed — GitHub 加速", menu)
+    threading.Thread(target=icon.run, daemon=True).start()
+    return icon
+
+
 def main():
     if os.name != "nt":
         print("此界面仅用于 Windows;macOS 请用 GHSpeed.app,Linux 请用命令行")
@@ -227,9 +304,27 @@ def main():
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
     except Exception:
         pass
-    root = tk.Tk()
-    App(root)
-    root.mainloop()
+    try:
+        root = tk.Tk()
+        app = App(root)
+        app.tray = setup_tray(app)
+        root.protocol("WM_DELETE_WINDOW", app.hide_to_tray)
+        root.mainloop()
+    except Exception:
+        # 打包成 exe 后 traceback 没人看得见:落盘 + 弹窗,别再无声消失
+        err = traceback.format_exc()
+        log = None
+        try:
+            log = os.path.join(os.environ.get("LOCALAPPDATA",
+                                              os.path.expanduser("~")),
+                               "GHSpeed_error.log")
+            with open(log, "a", encoding="utf-8") as f:
+                f.write(time.strftime("[%Y-%m-%d %H:%M:%S]\n") + err + "\n")
+        except Exception:
+            pass
+        ctypes.windll.user32.MessageBoxW(
+            None, "GHSpeed 启动失败:\n%s%s" % (err, "\n\n日志:" + log if log else ""),
+            "GHSpeed", 0x10)
 
 
 if __name__ == "__main__":
