@@ -7,7 +7,7 @@ import sys
 from importlib.machinery import SourceFileLoader
 
 out = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else "win_ui.png")
-root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 loader = SourceFileLoader("ghspeed_gui", os.path.join(root_dir, "ghspeed_gui.pyw"))
 spec = importlib.util.spec_from_loader("ghspeed_gui", loader)
 m = importlib.util.module_from_spec(spec)

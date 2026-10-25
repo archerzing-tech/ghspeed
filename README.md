@@ -125,7 +125,7 @@ GHSPEED_MIRRORS="https://your-mirror.example.com/" ghspeed dl <url>
 ## 已知限制
 
 - `raw.githubusercontent.com` 与 `gist.github.com` 在部分网络受 SNI 级阻断(与 IP 无关),hosts 钉不住浏览器访问——这两个域的资源走镜像下载(`ghspeed dl` / 菜单下载)即可
-- 本机直连链路若整段 TLS 被丢(坏窗口),`on` 会跨窗口重试(3/8 秒间隔,最多 3 轮,长坏窗口交给 30 分钟守护);极端情况下部分域名可能仍钉不上,等 30 分钟守护自动补
+- 直连链路整段 TLS 被丢时(「坏窗口」,几分钟一变),github.com 可能暂时连不上——这是网络本身在摆动,不是加速失效。refresh 会保留旧钉不回退,macOS 菜单栏检测到波动还会自动重测(免密时);窗口一开就恢复
 - 镜像列表内置 4 个公共 ghproxy 系镜像,失效时用 `GHSPEED_MIRRORS` 自行替换
 
 ## 构建
