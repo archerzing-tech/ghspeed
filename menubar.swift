@@ -126,6 +126,52 @@ func dnsOn() -> Bool {
     return FileManager.default.fileExists(atPath: "/var/root/.ghspeed/dns_backup.json")
 }
 
+// ---------------- 活动可视化:连接级实时 + 最近动作 ----------------
+
+func pinnedIPs() -> Set<String> {
+    var ips = Set<String>()
+    guard let s = try? String(contentsOfFile: "/etc/hosts", encoding: .utf8),
+          let rs = s.range(of: HOSTS_MARK) else { return ips }
+    for line in s[rs.upperBound...].split(separator: "\n") {
+        let p = line.split(separator: " ").map(String.init)
+        if p.count == 2, let c = p[0].first, c.isNumber { ips.insert(p[0]) }
+    }
+    return ips
+}
+
+// 正连着钉选 IP 的 ESTABLISHED 连接(= 请求正吃到加速)
+func liveConnections() -> (total: Int, names: [String]) {
+    let ips = pinnedIPs()
+    guard !ips.isEmpty else { return (0, []) }
+    let r = runShell(["/usr/sbin/lsof", "-i", "TCP", "-n", "-P", "+c", "0"], timeout: 10)
+    guard r.code == 0 else { return (0, []) }
+    var agg: [String: Int] = [:]
+    for line in r.out.split(separator: "\n") {
+        let p = line.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+        guard p.count >= 9, p[8].contains("->"),
+              line.contains("(ESTABLISHED)") else { continue }   // 状态是独立列
+        let remote = p[8].components(separatedBy: "->")[1]
+        let ip = remote.components(separatedBy: ":").dropLast().joined(separator: ":")
+        if ips.contains(ip) { agg[p[0], default: 0] += 1 }
+    }
+    return (agg.values.reduce(0, +),
+            agg.sorted { $0.value > $1.value }.map { "\($0.key)×\($0.value)" })
+}
+
+func latestAction() -> String? {
+    let path = NSHomeDirectory() + "/.ghspeed/activity.log"
+    guard let s = try? String(contentsOfFile: path, encoding: .utf8),
+          let line = s.split(separator: "\n").last,
+          let data = line.data(using: .utf8),
+          let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let act = o["action"] as? String else { return nil }
+    let df = DateFormatter()
+    df.dateFormat = "HH:mm"
+    let ts = (o["t"] as? Double).map { df.string(from: Date(timeIntervalSince1970: $0)) } ?? ""
+    let detail = o["detail"] as? String ?? ""
+    return "\(ts) \(act) \(detail)".trimmingCharacters(in: .whitespaces)
+}
+
 // 实测 github.com 延迟(HEAD,4 秒超时);返回毫秒,-1 不通
 func measureLatency() -> Int {
     // 连探两次:偶发丢一发就报"链路波动"太冤枉,失败后隔 1 秒再试
@@ -165,6 +211,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var downloading = false
     var timer: Timer?
     var lastHeal = Date.distantPast   // 坏窗口自动重测的限流
+    var liveItem: NSMenuItem!
+    var recentItem: NSMenuItem!
+    var liveCount = 0
 
     func applicationDidFinishLaunching(_ n: Notification) {
         item.button?.title = "🐙"
@@ -176,6 +225,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusLine.isEnabled = false
         latencyLine = menu.addItem(withTitle: "", action: nil, keyEquivalent: "")
         latencyLine.isEnabled = false
+        liveItem = menu.addItem(withTitle: "GitHub 活动:…", action: nil, keyEquivalent: "")
+        liveItem.isEnabled = false
+        recentItem = menu.addItem(withTitle: "", action: nil, keyEquivalent: "")
+        recentItem.isEnabled = false
         menu.addItem(.separator())
 
         toggleItem = addItem("开启加速", #selector(toggle))
@@ -193,6 +246,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshUI()
         timer = Timer.scheduledTimer(withTimeInterval: 120, repeats: true) { [weak self] _ in
             self?.refreshUI()
+        }
+        // 活动轮询:谁的连接正吃着钉选 IP + 最近一条自身动作,5 秒一拍
+        Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            DispatchQueue.global().async {
+                let r = liveConnections()
+                let latest = latestAction()
+                DispatchQueue.main.async {
+                    guard let self = self else { return }
+                    self.liveCount = r.total
+                    if r.total > 0 {
+                        self.liveItem.title = "⚡ GitHub 活动:\(r.total) 条连接 ← "
+                            + r.names.joined(separator: " ")
+                    } else {
+                        self.liveItem.title = "GitHub 活动:当前无连接(访问 GitHub 时自动命中钉选)"
+                    }
+                    self.recentItem.title = latest.map { "最近:\($0)" } ?? ""
+                    if !self.downloading {
+                        self.item.button?.title = self.liveCount > 0 ? "🐙⚡" : "🐙"
+                    }
+                }
+            }
         }
 
         // 启动即测:不等点「开启加速」,先在后台跑一轮(用户权限,只更新种子缓存,
@@ -232,7 +306,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 : "🐙 加速未开启"
             self.toggleItem.title = on ? "关闭加速" : "开启加速"
             self.latencyLine.title = "github.com:检测中…"
-            if !self.downloading { self.item.button?.title = "🐙" }
+            if !self.downloading {
+                self.item.button?.title = self.liveCount > 0 ? "🐙⚡" : "🐙"
+            }
             self.autostartItem.state = self.autostartInstalled() ? .on : .off
             self.dnsItem.state = dnsOn() ? .on : .off
         }

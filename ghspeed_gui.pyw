@@ -28,8 +28,8 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title("GHSpeed — GitHub 加速")
-        root.geometry("600x440")
-        root.minsize(540, 380)
+        root.geometry("660x450")
+        root.minsize(600, 400)
 
         self.status = tk.Label(root, text="读取状态中…", anchor="w",
                                font=("Microsoft YaHei UI", 11, "bold"))
@@ -53,6 +53,9 @@ class App:
         self.dns_btn = tk.Button(bar, text="DNS 接管", width=9,
                                  command=self.toggle_dns)
         self.dns_btn.pack(side="left")
+        self.live_btn = tk.Button(bar, text="活动", width=7,
+                                  command=self.run_live)
+        self.live_btn.pack(side="left", padx=8)
         self.about_btn = tk.Button(bar, text="关于", width=8, command=self.about)
         self.about_btn.pack(side="right")
 
@@ -64,6 +67,8 @@ class App:
         self.busy = False
         self.tray = None            # 托盘图标(pystray),main() 里装配
         self.hide_hint_shown = False
+        self.live_mode = False      # 活动视图开着时每 3 秒自动刷新
+        self._live_after = None
         self.refresh_ui()
         if "--elevated-on" in sys.argv:  # UAC 提权重启后自动开启
             self.root.after(300, self.toggle)
@@ -178,6 +183,7 @@ class App:
     def check_mirrors(self):
         if self.busy:
             return
+        self.stop_live()
         self.set_busy(True)
         self.status.config(text="⏳ 正在检测镜像…", fg="#b58900")
 
@@ -234,10 +240,53 @@ class App:
 
         threading.Thread(target=work, daemon=True).start()
 
+    # ---------------- 活动可视化 ----------------
+
+    def run_live(self):
+        """谁正连着钉选 IP(= 请求正吃到加速);开着时每 3 秒自动刷新"""
+        if self.busy:
+            return
+        self.live_mode = True
+        self.set_busy(True)
+        self.status.config(text="⚡ 活动监视中,每 3 秒刷新(点其他按钮退出该视图)",
+                           fg="#1a7f37")
+
+        def work():
+            buf = io.StringIO()
+            old, sys.stdout = sys.stdout, buf
+            try:
+                eng.cmd_live(None)
+            finally:
+                sys.stdout = old
+            text = buf.getvalue()
+            self.root.after(0, lambda: self.live_tick(text))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def live_tick(self, text):
+        if not self.live_mode:
+            return
+        self.set_busy(False)
+        self.out.config(state="normal")
+        self.out.delete("1.0", "end")
+        self.out.insert("1.0", text or "(无输出)")
+        self.out.config(state="disabled")
+        self._live_after = self.root.after(3000, self.run_live)
+
+    def stop_live(self):
+        self.live_mode = False
+        if self._live_after:
+            try:
+                self.root.after_cancel(self._live_after)
+            except Exception:
+                pass
+            self._live_after = None
+
     def run_diag(self):
         """多级通道自检:hosts/镜像池/ssh443/本地代理/DNS 一次看清"""
         if self.busy:
             return
+        self.stop_live()
         self.set_busy(True)
         self.status.config(text="⏳ 正在自检多级通道…", fg="#b58900")
 
@@ -254,6 +303,7 @@ class App:
         threading.Thread(target=work, daemon=True).start()
 
     def show_out(self, text):
+        self.stop_live()
         self.set_busy(False)
         self.refresh_ui()
         self.out.config(state="normal")

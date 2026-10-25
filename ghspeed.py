@@ -80,9 +80,9 @@ REFRESH_INTERVAL = 1800  # 秒
 try:
     with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "VERSION")) as _f:
-        __version__ = _f.read().strip() or "0.3.1"
+        __version__ = _f.read().strip() or "0.4.0"
 except Exception:
-    __version__ = "0.3.1"
+    __version__ = "0.4.0"
 
 # 只处理这些 GitHub 域名,一个都不多
 DOMAINS = [
@@ -257,6 +257,112 @@ def fetch_url(url, timeout=8):
     req = urllib.request.Request(url, headers={"User-Agent": UA, "accept": "*/*"})
     with urllib.request.urlopen(req, timeout=timeout, context=ssl_context()) as r:
         return r.read(1 << 20).decode("utf-8", "replace")
+
+
+# ---------------- 活动可视化:连接级实时 + 自身动作日志 ----------------
+# hosts 钉选是被动的(OS 直接命中,不经过本工具),"命中次数"原理上拿不到;
+# 可视化用两个真实信号:①谁的连接正连着钉选 IP(lsof/netstat 求交集),
+# ②ghspeed 自身动作(dl 走了哪个通道、refresh/on/off/ssh443/dns)落日志回放。
+
+ACTIVITY_FILE = os.path.join(os.path.expanduser("~"), ".ghspeed", "activity.log")
+
+
+def journal(action, detail=""):
+    """自身动作日志;root 同时落到系统态目录,读取时两边合并"""
+    entry = json.dumps({"t": round(time.time(), 1), "action": action,
+                        "detail": detail}, ensure_ascii=False)
+    for path in (ACTIVITY_FILE,):
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(entry + "\n")
+        except Exception:
+            pass
+    if is_admin() and STATE_DIR != os.path.dirname(ACTIVITY_FILE):
+        try:
+            os.makedirs(STATE_DIR, exist_ok=True)
+            with open(os.path.join(STATE_DIR, "activity.log"), "a",
+                      encoding="utf-8") as f:
+                f.write(entry + "\n")
+        except Exception:
+            pass
+
+
+def journal_tail(n=20):
+    """合并读取(用户文件 + 系统'目录,若有权限),返回最近 n 条 dict"""
+    seen, out = set(), []
+    for path in (os.path.join(STATE_DIR, "activity.log"), ACTIVITY_FILE):
+        try:
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and line not in seen:
+                        seen.add(line)
+                        try:
+                            out.append(json.loads(line))
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+    out.sort(key=lambda d: d.get("t", 0))
+    return out[-n:]
+
+
+def pinned_ips():
+    """当前钉选 IP 集合(hosts 块 + 上次测速缓存)"""
+    ips = set()
+    try:
+        ips.update(current_map_from_hosts().values())
+    except Exception:
+        pass
+    st = load_state()
+    if st:
+        for v in st.get("map", {}).values():
+            ips.add(v.get("ip", ""))
+    ips.discard("")
+    return ips
+
+
+def live_connections():
+    """[(进程名, 连接数)] —— 正连着钉选 IP 的 ESTABLISHED 连接"""
+    ips = pinned_ips()
+    if not ips:
+        return []
+    agg = {}
+    try:
+        if IS_WIN:
+            r = subprocess.run(["netstat", "-ano", "-p", "TCP"],
+                               capture_output=True, text=True, timeout=10)
+            pids = {}
+            for line in r.stdout.splitlines():
+                parts = line.split()
+                if len(parts) >= 5 and parts[3] == "ESTABLISHED":
+                    ip = parts[2].rsplit(":", 1)[0].strip("[]")
+                    if ip in ips:
+                        pids[parts[4]] = pids.get(parts[4], 0) + 1
+            if pids:
+                r2 = subprocess.run(["tasklist", "/FO", "CSV", "/NH"],
+                                    capture_output=True, text=True, timeout=10)
+                for line in r2.stdout.splitlines():
+                    cells = [c.strip().strip('"') for c in line.split('","')]
+                    if len(cells) >= 2 and cells[1] in pids:
+                        agg[cells[0]] = agg.get(cells[0], 0) + pids.pop(cells[1])
+            for pid, n in pids.items():   # 查不到名字的留 PID
+                agg["PID %s" % pid] = agg.get("PID %s" % pid, 0) + n
+        else:
+            r = subprocess.run(["lsof", "-i", "TCP", "-n", "-P", "+c", "0"],
+                               capture_output=True, text=True, timeout=10)
+            for line in r.stdout.splitlines()[1:]:
+                parts = line.split()
+                if len(parts) >= 9 and "->" in parts[8] \
+                        and "(ESTABLISHED)" in line:   # 状态在 NAME 之后的独立列
+                    remote = parts[8].split("->")[-1]
+                    ip = remote.rsplit(":", 1)[0].strip("[]")
+                    if ip in ips:
+                        agg[parts[0]] = agg.get(parts[0], 0) + 1
+    except Exception:
+        return []
+    return sorted(agg.items(), key=lambda kv: -kv[1])
 
 
 def validate_mirror(prefix, timeout=8):
@@ -780,6 +886,7 @@ def cmd_probe(args):
     if not state:
         sys.exit("没有任何可用 IP,请检查网络")
     save_state(state, dead)
+    journal("probe", "%d/%d 通" % (len(state), len(DOMAINS)))
     print("\n共 %d/%d 个域名可用,结果已缓存(启用请:sudo ghspeed on)"
           % (len(state), len(DOMAINS)))
     threading.Thread(  # 顺手把动态镜像池/hosts 源缓存也焐热,dl 和 mirrors 直接受益
@@ -804,6 +911,7 @@ def cmd_on(args):
     write_hosts(state)
     save_state(state, dead)
     daemon_install()
+    journal("on", "%d/%d 域名" % (len(state), len(DOMAINS)))
     print("\n已启用:%d/%d 个域名固定到最快 IP" % (len(state), len(DOMAINS)))
     print("  - hosts 备份:%s(首次启用时创建)" % BACKUP_FILE)
     print("  - 每 %d 分钟自动重测刷新,日志:%s" % (REFRESH_INTERVAL // 60, LOG_FILE))
@@ -814,6 +922,7 @@ def cmd_off(args):
     need_root()
     removed = remove_hosts()
     daemon_remove()
+    journal("off", "hosts 已还原" if removed else "本来就未开启")
     print("hosts 中的 ghspeed 条目:%s" % ("已移除" if removed else "本来就没有"))
     if os.path.exists(BACKUP_FILE):
         print("原始 hosts 备份仍在:%s" % BACKUP_FILE)
@@ -835,8 +944,10 @@ def cmd_refresh(args):
     if is_admin():
         if current_map_from_hosts() != {d: v["ip"] for d, v in state.items()}:
             write_hosts(state)
+            journal("refresh", "%d 域名已更新" % len(state))
             print("ghspeed: 刷新完成,%d 个域名已更新" % len(state))
         else:
+            journal("refresh", "IP 无变化")
             print("ghspeed: 刷新完成,IP 无变化")
     else:
         print("ghspeed: 已更新测速缓存(root 运行才会写 hosts)")
@@ -899,6 +1010,13 @@ def cmd_status(args):
     if not IS_LINUX:
         print("  ⑤ 系统 DNS       %s" % ("已接管(dns off 还原)"
               if os.path.exists(dns_backup_file()) else "未接管(可选:ghspeed dns on)"))
+    conns = live_connections()
+    if conns:
+        total = sum(n for _, n in conns)
+        print("  ⚡ 活动连接       %d 条 ← %s(ghspeed live 看详情)"
+              % (total, " ".join("%s×%d" % c for c in conns[:4])))
+    else:
+        print("  ⚡ 活动连接       当前无(访问 GitHub 时自动命中钉选)")
 
 
 # 真实 release 资产(借鉴 fnos-store mirrors.go 的测法):release 下载走
@@ -1046,9 +1164,12 @@ def cmd_dl(args):
             print("    失败:%s" % e)
             continue
         os.replace(part, out)
+        journal("dl", "%s | %s | %.2fMB/s"
+                % (name, label, got / max(secs, 1e-6) / 1e6))
         print("完成 → %s (%s, 平均 %.2f MB/s)"
               % (out, human(got), got / max(secs, 1e-6) / 1e6))
         return
+    journal("dl-fail", url)
     sys.exit("全部通道均失败;可稍后重试,或:① ghspeed mirrors 看镜像健康状况  "
              "② ghspeed proxy detect 找本地代理后 GHSPEED_PROXY=... ghspeed dl ...")
 
@@ -1163,6 +1284,7 @@ def cmd_ssh443(args):
         else:
             new = (cfg.rstrip("\n") + "\n\n" if cfg.strip() else "") + SSH_BLOCK
         ssh_write_config(new)
+        journal("ssh443-on")
         print("已写入 %s:github.com 的 SSH 改走 ssh.github.com:443" % ssh_config_file())
         print("验证:ghspeed ssh443 test;还原:ghspeed ssh443 off")
     else:
@@ -1170,6 +1292,7 @@ def cmd_ssh443(args):
             new = re.sub(re.escape(SSH_MARK_S) + r".*?" + re.escape(SSH_MARK_E)
                          + r"\n?", "", cfg, flags=re.S)
             ssh_write_config(new)
+            journal("ssh443-off")
             print("已移除 ssh443 配置,git 恢复默认 22 口")
         else:
             print("本来就没有开启")
@@ -1257,6 +1380,7 @@ def cmd_dns(args):
                        "items": backup}, f, ensure_ascii=False, indent=1)
         for s, _ in items:
             _dns_apply(s, DNS_CLEAN)
+        journal("dns-on", " ".join(DNS_CLEAN))
         print("已把系统 DNS 换成 %s(原配置备份在 %s)" % (" ".join(DNS_CLEAN), dns_backup_file()))
         print("影响全部网站(不只 GitHub);还原:ghspeed dns off")
     else:
@@ -1268,6 +1392,7 @@ def cmd_dns(args):
         for item in backup:
             _dns_apply(item["svc"], item["dns"])
         os.remove(dns_backup_file())
+        journal("dns-off")
         print("已按备份还原系统 DNS")
 
 
@@ -1311,6 +1436,30 @@ def _dns_apply(svc, servers):
                  if servers else "-ResetServerAddresses"))
         subprocess.run(["powershell", "-NoProfile", "-Command", ps],
                        capture_output=True, text=True)
+
+
+def cmd_live(args):
+    conns = live_connections()
+    if not conns:
+        print("当前没有正在进行的 GitHub 连接。")
+        print("(hosts 钉选是系统级被动命中,你一访问 GitHub 就自动生效,无需常驻)")
+        return
+    total = sum(n for _, n in conns)
+    print("正在吃加速度的 GitHub 连接(远端 IP 来自 ghspeed 钉选):共 %d 条" % total)
+    for name, n in conns:
+        print("  %-28s %d 条" % (name, n))
+    print("\nghspeed 自身动作日志:ghspeed activity")
+
+
+def cmd_activity(args):
+    entries = journal_tail(20)
+    if not entries:
+        print("还没有动作记录(下载/测速/开关加速/ssh443/DNS 时自动记录)")
+        return
+    print("最近 %d 条 ghspeed 动作:" % len(entries))
+    for e in entries:
+        t = time.strftime("%m-%d %H:%M:%S", time.localtime(e.get("t", 0)))
+        print("  %s  %-9s %s" % (t, e.get("action", ""), e.get("detail", "")))
 
 
 def cmd_install(args):
@@ -1377,6 +1526,12 @@ def main():
 
     sub.add_parser("proxy", help="探测本机代理端口并给出接管命令(只检测,不接管)"
                    ).set_defaults(func=cmd_proxy)
+
+    sub.add_parser("live", help="看当前谁正连着钉选 IP(请求吃到加速的实时视图)"
+                   ).set_defaults(func=cmd_live)
+
+    sub.add_parser("activity", help="回放 ghspeed 自身动作日志(下载/刷新/开关)"
+                   ).set_defaults(func=cmd_activity)
 
     p = sub.add_parser("dns", help="系统 DNS 换成干净公共 DNS(opt-in,影响全部网站;off 原样还原)")
     p.add_argument("action", choices=["on", "off", "show"])
