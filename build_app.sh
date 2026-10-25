@@ -7,7 +7,9 @@ cd "$(dirname "$0")"
 VERSION=$(cat VERSION)
 APP=dist/GHSpeed.app
 
-rm -rf dist
+# 清理上一次产物;若含 root 属主残留(被系统 installer 摸过的 dist),
+# rm 会失败 —— 改为整体挪走(父目录归用户,mv 不受内部属主影响)
+rm -rf dist 2>/dev/null || mv dist "dist.trash.$(date +%s)"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 cat > "$APP/Contents/Info.plist" <<EOF
