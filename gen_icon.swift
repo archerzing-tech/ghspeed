@@ -7,13 +7,14 @@ let size = NSSize(width: 1024, height: 1024)
 let img = NSImage(size: size)
 img.lockFocus()
 
-// 背景:macOS 风格圆角方块 + 蓝紫渐变
+// 背景:白色圆角方块 + 浅灰描边(纯白在浅色窗口里也能看出轮廓)
 let rect = NSRect(x: 100, y: 100, width: 824, height: 824)
 let bg = NSBezierPath(roundedRect: rect, xRadius: 184, yRadius: 184)
-NSGradient(colors: [
-    NSColor(calibratedRed: 0.18, green: 0.42, blue: 0.98, alpha: 1),
-    NSColor(calibratedRed: 0.38, green: 0.18, blue: 0.90, alpha: 1),
-])!.draw(in: bg, angle: -70)
+NSColor.white.setFill()
+bg.fill()
+NSColor(calibratedWhite: 0.82, alpha: 1).setStroke()
+bg.lineWidth = 14
+bg.stroke()
 
 // 小章鱼(与菜单栏 🐙 同款形象)
 let para = NSMutableParagraphStyle()
