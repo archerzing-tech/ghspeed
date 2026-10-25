@@ -68,19 +68,20 @@ jobs:
           python -c "from PIL import Image; im = Image.open('icons/icon_1024.png'); im.save('icons/icon.ico', sizes=[(16,16),(24,24),(32,32),(48,48),(64,64),(128,128),(256,256)])"
           Copy-Item ghspeed_gui.pyw gui_entry.py
           pyinstaller --onefile --noconsole --name GHSpeed --icon icons/icon.ico --add-data "icons/icon_1024.png;icons" --hidden-import pystray._win32 gui_entry.py
-          pyinstaller --onefile --name ghspeed --icon icons/icon.ico ghspeed.py
+          pyinstaller --onefile --name ghspeed-cli --icon icons/icon.ico ghspeed.py
 
-      - name: 冒烟测试 GHSpeed.exe(真机启动,15 秒存活才算过)
+      - name: 冒烟测试(GHSpeed.exe 必须真机启动出可见 GUI 窗口;CLI 可运行)
         shell: pwsh
         run: |
           Start-Process -FilePath dist\GHSpeed.exe
           Start-Sleep -Seconds 15
           $p = Get-Process GHSpeed -ErrorAction SilentlyContinue
-          if ($p) {
-            Write-Host "GHSpeed.exe alive (pid $($p.Id))"
+          if ($p -and $p.MainWindowHandle -ne 0 -and $p.MainWindowTitle -like "*GitHub*") {
+            Write-Host "GHSpeed.exe GUI alive, window='$($p.MainWindowTitle)'"
             Stop-Process -Id $p.Id -Force
           } else {
-            Write-Host "GHSpeed.exe died at startup, dumping diagnostics:"
+            $t = if ($p) { $p.MainWindowTitle } else { "(process dead)" }
+            Write-Host "GHSpeed.exe is not a visible GUI window (title='$t')"
             if (Test-Path "$env:LOCALAPPDATA\GHSpeed_error.log") {
               Get-Content "$env:LOCALAPPDATA\GHSpeed_error.log" | Select-Object -Last 40
             }
@@ -89,6 +90,9 @@ jobs:
             }
             exit 1
           }
+          $v = & dist\ghspeed-cli.exe --version
+          Write-Host "CLI: $v"
+          if ($v -notmatch "ghspeed") { exit 1 }
 
       - name: Build installer (Inno Setup)
         shell: pwsh
@@ -98,7 +102,7 @@ jobs:
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DAppVersion=$v" packaging/windows/installer.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           New-Item -ItemType Directory -Path stage\GHSpeed | Out-Null
-          Copy-Item dist\GHSpeed.exe, dist\ghspeed.exe, ghspeed.py, ghspeed_gui.pyw, ghspeed.bat, README.md stage\GHSpeed\
+          Copy-Item dist\GHSpeed.exe, dist\ghspeed-cli.exe, ghspeed.py, ghspeed_gui.pyw, ghspeed.bat, README.md stage\GHSpeed\
           Compress-Archive -Path stage\GHSpeed -DestinationPath "GHSpeed-windows-${{ github.ref_name }}.zip"
           Get-ChildItem dist\*.exe, *.zip | Select-Object Name, Length
 
@@ -144,7 +148,8 @@ jobs:
           3. 关闭窗口会最小化到任务栏托盘 🐙,右键托盘图标可退出
           4. 也可用 \`GHSpeed-windows-*.zip\` 便携版(解压双击 \`GHSpeed.exe\`)
 
-          注意:小写的 \`ghspeed.exe\` 是命令行版,双击只弹黑窗;图形界面请用 \`GHSpeed.exe\`
+          注意:命令行版叫 \`ghspeed-cli.exe\`(终端里用);图形界面是 \`GHSpeed.exe\`。
+          v0.3.1 起两者不同名:NTFS 大小写不敏感,旧版同目录互相覆盖会导致"点开是黑窗"
 
           ### 多级可访问性阶梯(HTTPS 被掐时逐级退守)
           1. hosts 钉 IP(候选含社区 hosts 源,验证后才入池)+ 动态镜像池(发布站拉取,逐个验证)

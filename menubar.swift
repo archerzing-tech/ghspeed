@@ -121,6 +121,11 @@ func hostsOn() -> (on: Bool, count: Int) {
     return (true, n)
 }
 
+// 系统 DNS 是否已接管(root 引擎的备份落在 /var/root)
+func dnsOn() -> Bool {
+    return FileManager.default.fileExists(atPath: "/var/root/.ghspeed/dns_backup.json")
+}
+
 // 实测 github.com 延迟(HEAD,4 秒超时);返回毫秒,-1 不通
 func measureLatency() -> Int {
     // 连探两次:偶发丢一发就报"链路波动"太冤枉,失败后隔 1 秒再试
@@ -154,6 +159,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var mirrorsItem: NSMenuItem!
     var downloadItem: NSMenuItem!
     var autostartItem: NSMenuItem!
+    var dnsItem: NSMenuItem!
     var actionItems: [NSMenuItem] = []
     var busy = false
     var downloading = false
@@ -179,9 +185,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         downloadItem = addItem("⬇️ 下载剪贴板中的 GitHub 链接", #selector(downloadClip))
         menu.addItem(.separator())
         autostartItem = addItem("开机自启", #selector(toggleAutostart))
+        dnsItem = addItem("系统 DNS 接管(可选)", #selector(toggleDNS))
         addItem("关于 GHSpeed", #selector(about))
         addItem("退出", #selector(quit))
-        actionItems = [toggleItem, refreshItem, mirrorsItem, downloadItem, autostartItem]
+        actionItems = [toggleItem, refreshItem, mirrorsItem, downloadItem, autostartItem, dnsItem]
 
         refreshUI()
         timer = Timer.scheduledTimer(withTimeInterval: 120, repeats: true) { [weak self] _ in
@@ -227,6 +234,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.latencyLine.title = "github.com:检测中…"
             if !self.downloading { self.item.button?.title = "🐙" }
             self.autostartItem.state = self.autostartInstalled() ? .on : .off
+            self.dnsItem.state = dnsOn() ? .on : .off
         }
         DispatchQueue.global().async {
             let ms = measureLatency()
@@ -402,6 +410,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             notify("GitHub 加速", "已设置开机自启")
         }
         refreshUI()
+    }
+
+    // 系统 DNS 接管:opt-in(影响全部网站),原配置自动备份,再点一次原样还原
+    @objc func toggleDNS(_ s: Any) {
+        if busy { return }
+        let on = dnsOn()
+        if !on {
+            let alert = NSAlert()
+            alert.messageText = "接管系统 DNS?"
+            alert.informativeText = "换成国内不投毒的公共 DNS(阿里 223.5.5.5 / 腾讯 119.29.29.29)。\n"
+                + "影响全部网站(不只 GitHub);原配置自动备份,再点本项即原样还原。"
+            alert.addButton(withTitle: "接管")
+            alert.addButton(withTitle: "取消")
+            if alert.runModal() != .alertFirstButtonReturn { return }
+        }
+        setBusy(true)
+        statusLine.title = on ? "⏳ 正在还原系统 DNS…" : "⏳ 正在接管系统 DNS…"
+        adminEngine(["dns", on ? "off" : "on"]) { ok, out in
+            self.setBusy(false)
+            notify("GitHub 加速", ok
+                ? (on ? "已还原系统 DNS" : "已接管系统 DNS(阿里/腾讯,备份可随时还原)✅")
+                : "DNS 操作失败:\(out.suffix(120))")
+            self.refreshUI()
+        }
     }
 
     @objc func about(_ s: Any) {

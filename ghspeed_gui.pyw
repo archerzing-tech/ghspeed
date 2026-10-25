@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 import traceback
+import types
 import tkinter as tk
 from tkinter import messagebox
 from tkinter.scrolledtext import ScrolledText
@@ -49,6 +50,9 @@ class App:
         self.diag_btn = tk.Button(bar, text="诊断", width=8,
                                   command=self.run_diag)
         self.diag_btn.pack(side="left", padx=8)
+        self.dns_btn = tk.Button(bar, text="DNS 接管", width=9,
+                                 command=self.toggle_dns)
+        self.dns_btn.pack(side="left")
         self.about_btn = tk.Button(bar, text="关于", width=8, command=self.about)
         self.about_btn.pack(side="right")
 
@@ -63,6 +67,8 @@ class App:
         self.refresh_ui()
         if "--elevated-on" in sys.argv:  # UAC 提权重启后自动开启
             self.root.after(300, self.toggle)
+        elif "--elevated-dns" in sys.argv:  # UAC 提权重启后自动接管/还原 DNS
+            self.root.after(300, self.toggle_dns)
 
     # ---------------- 状态 ----------------
 
@@ -79,6 +85,7 @@ class App:
                            else "加速未开启",
                            fg=("#1a7f37" if on else "#999999"))
         self.toggle_btn.config(text="关闭加速" if on else "开启加速")
+        self.dns_btn.config(text="DNS 还原" if self.dns_on() else "DNS 接管")
         self.latency.config(text="github.com:检测中…")
         threading.Thread(target=self._latency_worker, daemon=True).start()
 
@@ -183,6 +190,47 @@ class App:
                 sys.stdout = old
             text = buf.getvalue()
             self.root.after(0, lambda: self.show_out(text))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---------------- DNS(opt-in 全局接管,原配置自动备份可还原) ----------------
+
+    @staticmethod
+    def dns_on():
+        try:
+            return os.path.exists(eng.dns_backup_file())
+        except Exception:
+            return False
+
+    def toggle_dns(self):
+        if self.busy:
+            return
+        turning_on = not self.dns_on()
+        resumed = "--elevated-dns" in sys.argv  # 提权重启的续做实例,不再二次确认
+        if turning_on and not resumed and not messagebox.askyesno(
+                APP, "把系统 DNS 换成国内不投毒的公共 DNS"
+                     "(阿里 223.5.5.5 / 腾讯 119.29.29.29)?\n\n"
+                     "影响全部网站(不只 GitHub);原配置自动备份,"
+                     "之后点同一按钮即原样还原。"):
+            return
+        if not eng.is_admin():
+            self.elevate("--elevated-dns")
+            return
+        self.set_busy(True)
+        self.status.config(text="⏳ 正在%s系统 DNS…" % ("接管" if turning_on else "还原"),
+                           fg="#b58900")
+
+        def work():
+            try:
+                eng.cmd_dns(types.SimpleNamespace(
+                    action="on" if turning_on else "off"))
+                ok = True
+                msg = "已%s系统 DNS ✅" % ("接管" if turning_on else "还原")
+            except SystemExit as e:   # 引擎用 sys.exit 报业务错误
+                ok, msg = False, "DNS 操作失败:%s" % e
+            except Exception as e:
+                ok, msg = False, "DNS 操作失败:%s" % e
+            self.root.after(0, lambda: self.done(ok, msg))
 
         threading.Thread(target=work, daemon=True).start()
 

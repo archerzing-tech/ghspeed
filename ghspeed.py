@@ -80,9 +80,9 @@ REFRESH_INTERVAL = 1800  # 秒
 try:
     with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "VERSION")) as _f:
-        __version__ = _f.read().strip() or "0.3.0"
+        __version__ = _f.read().strip() or "0.3.1"
 except Exception:
-    __version__ = "0.3.0"
+    __version__ = "0.3.1"
 
 # 只处理这些 GitHub 域名,一个都不多
 DOMAINS = [
@@ -690,9 +690,13 @@ WantedBy=timers.target
 
 def daemon_install():
     if getattr(sys, "frozen", False):
-        # PyInstaller 打包的 ghspeed.exe:__file__ 指向临时解压目录,重启即失效,
-        # 只能以 exe 自身作为定时任务入口
-        exe, script, minutes = sys.executable, "", REFRESH_INTERVAL // 60
+        # PyInstaller 打包:__file__ 指向临时解压目录,重启即失效,只能用 exe;
+        # Windows 下定时刷新必须走命令行版 ghspeed-cli.exe —— GUI 的 GHSpeed.exe
+        # 带参数只会开界面不会刷新(NTFS 大小写不敏感,GUI/CLI 必须不同名)
+        exe = os.path.join(os.path.dirname(sys.executable), "ghspeed-cli.exe")
+        if not os.path.exists(exe):
+            exe = sys.executable   # 单发场景没带 CLI,退回自身
+        script, minutes = "", REFRESH_INTERVAL // 60
     else:
         exe, script, minutes = sys.executable, os.path.realpath(__file__), REFRESH_INTERVAL // 60
     if IS_WIN:
@@ -1240,6 +1244,7 @@ def cmd_dns(args):
               "(存在 → dns off 可还原)" if os.path.exists(dns_backup_file())
               else "(不存在,说明没接管过)"))
         return
+    need_root()   # 改系统 DNS 要管理员;show 不用
 
     items = _dns_current()
     if args.action == "on":

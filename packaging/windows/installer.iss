@@ -33,7 +33,8 @@ Name: "addpath"; Description: "把命令行 ghspeed 加入 PATH(新开的终端�
 
 [Files]
 Source: "..\..\dist\GHSpeed.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\..\dist\ghspeed.exe"; DestDir: "{app}"; Flags: ignoreversion
+; CLI 单独命名 ghspeed-cli.exe:NTFS 大小写不敏感,GHSpeed.exe/ghspeed.exe 同目录会互相覆盖
+Source: "..\..\dist\ghspeed-cli.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
@@ -99,7 +100,7 @@ begin
       RegWriteStringValue(HKEY_CURRENT_USER, 'Environment', 'Path', Removed);
     end;
     MsgBox('如之前已开启加速,建议以管理员运行:' + #13#10 +
-           '  ' + AppDir + '\ghspeed.exe off' + #13#10 +
+           '  ' + AppDir + '\ghspeed-cli.exe off' + #13#10 +
            '以还原 hosts 并移除定时任务。', mbInformation, MB_OK);
   end;
 end;
