@@ -153,6 +153,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var busy = false
     var downloading = false
     var timer: Timer?
+    var lastHeal = Date.distantPast   // 坏窗口自动重测的限流
 
     func applicationDidFinishLaunching(_ n: Notification) {
         item.button?.title = "🐙"
@@ -225,10 +226,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         DispatchQueue.global().async {
             let ms = measureLatency()
             DispatchQueue.main.async {
-                self.latencyLine.title = ms < 0
-                    ? "github.com:当前直连不通(建议开启加速)"
-                    : "github.com:\(ms) ms"
+                if ms >= 0 {
+                    self.latencyLine.title = "github.com:\(ms) ms"
+                } else if self.hostsOn().on {
+                    // 已开启还不通 = 坏窗口(TLS 整段被丢),不是没加速
+                    self.latencyLine.title = "github.com:链路波动中(通常几分钟内自动恢复)"
+                    self.autoHealIfNeeded()
+                } else {
+                    self.latencyLine.title = "github.com:当前直连不通(建议开启加速)"
+                }
             }
+        }
+    }
+
+    // 已开启但 github.com 不通 → 免密可用就静默重测钉新 IP(10 分钟最多一次)
+    func autoHealIfNeeded() {
+        guard Date().timeIntervalSince(lastHeal) > 600,
+              FileManager.default.fileExists(atPath: ENGINE_BIN) else { return }
+        lastHeal = Date()
+        DispatchQueue.global().async { [weak self] in
+            let r = runShell(["/usr/bin/sudo", "-n", ENGINE_BIN, "refresh", "-q"],
+                             timeout: 300)
+            if r.code == 0 {
+                notify("GitHub 加速", "检测到链路波动,已自动重测并更新最优 IP")
+            }
+            DispatchQueue.main.async { self?.refreshUI() }
         }
     }
 

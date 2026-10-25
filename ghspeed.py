@@ -377,6 +377,20 @@ def find_best(progress=False, on_round=None):
 # ---------------- /etc/hosts ----------------
 
 
+def merge_with_existing(state):
+    """本轮没测通的域名,保留 hosts 里的旧钉(旧 IP 再差也比裸奔强)。
+
+    坏窗口期间某域整轮全败,write_hosts 会把它原本钉好的条目刷掉;
+    等窗口开了,主域反而没了 pin,只能吃污染 DNS —— github.com 从
+    hosts 里消失就是这个原因。以 hosts 现有条目兜底补齐。
+    """
+    old = current_map_from_hosts()
+    for d in DOMAINS:
+        if d not in state and d in old:
+            state[d] = {"ip": old[d], "rtt_ms": -1}
+    return state
+
+
 def hosts_block(state):
     hint = "ghspeed off 可整体移除" if IS_WIN else "sudo ghspeed off 可整体移除"
     lines = [MARK_S, "# ghspeed 自动生成,勿手改;" + hint]
@@ -598,12 +612,13 @@ def cmd_on(args):
         # 边测边生效:每轮结束把已测通的域名先钉进 hosts,
         # 用户侧 github.com 早点能用,不必等全部测完
         if partial:
-            write_hosts(partial)
+            write_hosts(merge_with_existing(dict(partial)))
             flush_dns()
 
     state, dead = find_best(progress=True, on_round=on_round)
     if not state:
         sys.exit("没有测到任何可用 IP,本次不做任何修改")
+    state = merge_with_existing(state)
     write_hosts(state)
     save_state(state, dead)
     daemon_install()
@@ -626,12 +641,14 @@ def cmd_off(args):
 def cmd_refresh(args):
     def on_round(partial):
         if is_admin() and partial:
-            write_hosts(partial)
+            write_hosts(merge_with_existing(dict(partial)))
 
     state, dead = find_best(progress=not args.quiet, on_round=on_round)
     if not state:
         print("ghspeed: 本次未测到可用 IP,保留现有 hosts 不变")
         return
+    if is_admin():
+        state = merge_with_existing(state)
     save_state(state, dead)
     if is_admin():
         if current_map_from_hosts() != {d: v["ip"] for d, v in state.items()}:
