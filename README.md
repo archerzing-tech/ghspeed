@@ -28,7 +28,9 @@ GitHub 加速工具:测速固定最快 IP + 镜像加速下载,只解决 GitHub 
 
 ## 安装
 
-从 [Releases](../../releases) 下载,二选一:
+从 [Releases](../../releases) 按平台下载对应包:
+
+### macOS 10.13+
 
 **方式一:`.pkg` 安装包(推荐,双击即装)**
 
@@ -53,7 +55,7 @@ git clone https://github.com/archerzing-tech/ghspeed.git
 cd ghspeed && sudo ./install.sh && sudo ghspeed on
 ```
 
-### Windows 10+(简易界面)
+### Windows 10+
 
 1. 先装 [Python 3](https://www.python.org/downloads/)(安装时勾选 **Add to PATH**)
 2. 下载 `GHSpeed-windows-*.zip` 解压,**双击 `GHSpeed_gui.pyw`** 打开界面(无黑窗口)
@@ -73,32 +75,37 @@ sudo ghspeed off                 # 完全还原
 
 ## 使用
 
-### 菜单栏(推荐)
+### macOS 菜单栏
 
 点 🐙:
 
 | 菜单项 | 说明 |
 |---|---|
 | 状态行 | 加速开关状态、固定域名数、github.com 实测延迟(5 分钟自动刷新) |
-| 开启加速 / 关闭加速 | 核心开关;关闭完全还原 `/etc/hosts` 与定时任务 |
+| 开启加速 / 关闭加速 | 核心开关;关闭完全还原 hosts 与定时任务 |
 | 立即测速刷新 | 手动重测一遍最优 IP |
 | 镜像检测… | 并发探测各镜像健康度与延迟 |
 | ⬇️ 下载剪贴板中的 GitHub 链接 | 复制链接 → 点一下,图标显示 `⬇️ xx%`,完成后弹通知,文件落在「下载」 |
 | 开机自启 | 用户级 LaunchAgent,无需管理员 |
 | 关于 GHSpeed | 显示版本号与项目地址 |
 
-**启动即测**:应用一启动就在后台先跑一轮测速(用户权限,不写 hosts、不弹密码),结果存入种子缓存——之后点「开启加速」或「立即测速刷新」大多直接走种子轮,几秒完成。若当时已开启加速且配好了免密授权,启动测完还会自动把更优 IP 应用上,无需任何点击。
+**启动即测**:应用一启动就在后台先跑一轮测速(用户权限,不写 hosts、不弹密码),结果存入种子缓存——之后点「开启加速」或「立即测速刷新」大多直接走种子轮,几秒完成。若当时已开启加速且配好了免密授权,启动测完还会自动把更优 IP 应用上,无需任何点击;检测到链路波动(已开启但不通)也会自动重测自愈。
 
-### 命令行
+### Windows 简易界面
+
+双击 `GHSpeed_gui.pyw` 打开,按钮与 macOS 菜单一一对应:开启/关闭加速、立即测速刷新、镜像检测(结果直接显示在窗口里)、关于(版本号)。开启加速时弹 UAC 授权,提权后自动把开启做完。
+
+### 命令行(三平台通用)
 
 ```
-ghspeed on | off          开启/关闭(还原 hosts 与 launchd 守护)
+ghspeed on | off          开启/关闭(还原 hosts 与定时任务)
 ghspeed status            查看固定 IP、延迟、守护状态
 ghspeed probe             手动测速(不写 hosts)
 ghspeed mirrors           镜像健康检查
-ghspeed refresh           重测并更新 hosts(root)
+ghspeed refresh           重测并更新 hosts(root / 管理员)
 ghspeed dl <url> [-o 路径] [--direct] [--min-speed KB/s]
 ghspeed git on | off      git clone 走镜像(push 前记得 off)
+ghspeed --version         版本号
 ```
 
 自定义镜像列表:
@@ -110,18 +117,20 @@ GHSPEED_MIRRORS="https://your-mirror.example.com/" ghspeed dl <url>
 ## 工作原理
 
 ```
-┌─ GUI 壳 ─────────────────────────────┐
-│  GHSpeed.app (Swift NSStatusItem)     │
-└──────────────┬───────────────────────┘
-               │ 调用
-┌─ CLI 引擎 ───▼───────────────────────┐
-│  ghspeed.py (纯标准库 Python 3)       │
-│  · DoH + 静态网段候选 IP              │
-│  · 并发 TLS 握手测速(SNI 验证书)     │
-│  · 最快 IP → /etc/hosts 标记块        │
-│  · launchd 每 30 分钟自动重测         │
-│  · 下载:镜像回退链+断点续传+停滞跳道  │
-└──────────────────────────────────────┘
+┌─ 平台壳 ────────────────────────────────────┐
+│  macOS:GHSpeed.app(菜单栏 🐙)              │
+│  Windows:ghspeed_gui.pyw(tkinter 窗口)    │
+│  Linux:无(直接用命令行)                    │
+└──────────────┬──────────────────────────────┘
+               │ 调用(同一份引擎)
+┌─ CLI 引擎 ───▼──────────────────────────────┐
+│  ghspeed.py(纯标准库 Python 3,三平台通用) │
+│  · DoH + 静态网段候选 IP                     │
+│  · 并发 TLS 握手测速(SNI 验证书)            │
+│  · 最快 IP → hosts 标记块                    │
+│  · 定时重测:launchd / systemd / 计划任务    │
+│  · 下载:镜像回退链+断点续传+停滞跳道        │
+└─────────────────────────────────────────────┘
 ```
 
 只动这些 GitHub 域名:`github.com`、`api`、`codeload`、`*.githubusercontent.com` 等 13 个;不改系统代理、不改 DNS 服务器、其他网站一概不处理,`off` 后零残留。
