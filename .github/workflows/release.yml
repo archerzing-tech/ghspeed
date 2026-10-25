@@ -1,0 +1,52 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build GHSpeed.app
+        run: ./build_app.sh
+
+      - name: Package
+        run: |
+          cd dist
+          zip -qry "GHSpeed-macos-${GITHUB_REF_NAME}.zip" GHSpeed.app
+          ls -lh *.zip
+
+      - name: Upload artifact (手动触发时)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: GHSpeed-macos-${{ github.ref_name }}
+          path: dist/*.zip
+
+      - name: Create GitHub Release (打 tag 时)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-ghrelease@v2
+        with:
+          name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          body: |
+            ## GHSpeed ${{ github.ref_name }}
+
+            macOS 专用 GitHub 加速工具:菜单栏一键开关,IP 测速固定 + 镜像加速下载。
+
+            **当前仅支持 macOS。**
+
+            ### 安装
+            1. 下载下方 `GHSpeed-macos-*.zip` 并解压
+            2. 把 `GHSpeed.app` 拖到「应用程序」
+            3. 首次打开:右键点击 → 「打开」(绕过 Gatekeeper,应用为 ad-hoc 签名)
+            4. 点菜单栏 🐙 → 「开启加速」,输入一次管理员密码即可
+          files: dist/*.zip
