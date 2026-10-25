@@ -185,7 +185,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 : "🐙 加速未开启"
             self.toggleItem.title = on ? "关闭加速" : "开启加速"
             self.latencyLine.title = "github.com:检测中…"
-            if !self.downloading { self.item.button?.title = on ? "🚀" : "🐙" }
+            if !self.downloading { self.item.button?.title = "🐙" }
             self.autostartItem.state = self.autostartInstalled() ? .on : .off
         }
         DispatchQueue.global().async {

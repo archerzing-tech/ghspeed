@@ -15,21 +15,19 @@ NSGradient(colors: [
     NSColor(calibratedRed: 0.38, green: 0.18, blue: 0.90, alpha: 1),
 ])!.draw(in: bg, angle: -70)
 
-// 白色闪电(GitHub 加速 = 闪电劈在方块上)
-let bolt = NSBezierPath()
-bolt.move(to: NSPoint(x: 590, y: 860))
-bolt.line(to: NSPoint(x: 350, y: 560))
-bolt.line(to: NSPoint(x: 495, y: 560))
-bolt.line(to: NSPoint(x: 430, y: 220))
-bolt.line(to: NSPoint(x: 690, y: 545))
-bolt.line(to: NSPoint(x: 545, y: 545))
-bolt.line(to: NSPoint(x: 640, y: 860))
-bolt.close()
-NSColor.white.setFill()
-bolt.fill()
-// 闪电底边一点投影层次
-NSColor(calibratedWhite: 1.0, alpha: 0.25).setFill()
-NSBezierPath(rect: NSRect(x: 0, y: 0, width: 0, height: 0)).fill()
+// 小章鱼(与菜单栏 🐙 同款形象)
+let para = NSMutableParagraphStyle()
+para.alignment = .center
+let attrs: [NSAttributedString.Key: Any] = [
+    .font: NSFont.systemFont(ofSize: 640),
+    .paragraphStyle: para,
+]
+let octo = "🐙" as NSString
+let sz = octo.size(withAttributes: attrs)
+octo.draw(in: NSRect(x: (1024 - sz.width) / 2,
+                     y: (1024 - sz.height) / 2 - 30,
+                     width: sz.width, height: sz.height),
+          withAttributes: attrs)
 
 img.unlockFocus()
 
