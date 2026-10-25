@@ -41,4 +41,4 @@ def shot():
 
 root.after(18000, shot)  # 等镜像检测出结果
 root.mainloop()
-print("已保存", out)
+print("saved:", out)  # CI 控制台是 cp1252,别打中文

@@ -14,6 +14,10 @@ GitHub 加速工具:测速固定最快 IP + 镜像加速下载,只解决 GitHub 
 |:---:|:---:|:---:|
 | ![菜单栏上的小章鱼](docs/menubar.png) | ![点开的菜单](docs/menu.png) | ![应用图标](docs/icon.png) |
 
+**Windows 10+ 简易界面(tkinter,真机截图):**
+
+![Windows 界面](docs/windows-ui.png)
+
 ## 它解决什么
 
 1. **加快访问 github** — 并发探测已知 GitHub 网段 + DoH 解析结果,按域名做 TLS 握手测速(证书验证防污染 IP),把最快 IP 写入 hosts 标记块,并装定时任务每 30 分钟自动重测换优
