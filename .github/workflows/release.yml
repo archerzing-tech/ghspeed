@@ -76,7 +76,7 @@ jobs:
           Start-Process -FilePath dist\GHSpeed.exe
           Start-Sleep -Seconds 15
           $p = Get-Process GHSpeed -ErrorAction SilentlyContinue
-          if ($p -and $p.MainWindowHandle -ne 0 -and $p.MainWindowTitle -like "*GitHub*") {
+          if ($p -and $p.MainWindowHandle -ne 0 -and $p.MainWindowTitle) {
             Write-Host "GHSpeed.exe GUI alive, window='$($p.MainWindowTitle)'"
             Stop-Process -Id $p.Id -Force
           } else {

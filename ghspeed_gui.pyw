@@ -352,14 +352,14 @@ def setup_tray(app):
         return lambda ic, it: root.after(0, fn)
 
     menu = pystray.Menu(
-        pystray.Item("显示主窗口", handler(app.show_window), default=True),
+        pystray.MenuItem("显示主窗口", handler(app.show_window), default=True),
         pystray.Menu.SEPARATOR,
-        pystray.Item("开启/关闭加速", handler(app.toggle)),
-        pystray.Item("立即测速刷新", handler(app.refresh_now)),
-        pystray.Item("镜像检测", handler(app.check_mirrors)),
+        pystray.MenuItem("开启/关闭加速", handler(app.toggle)),
+        pystray.MenuItem("立即测速刷新", handler(app.refresh_now)),
+        pystray.MenuItem("镜像检测", handler(app.check_mirrors)),
         pystray.Menu.SEPARATOR,
-        pystray.Item("关于", handler(app.about)),
-        pystray.Item("退出", handler(app.quit_app)),
+        pystray.MenuItem("关于", handler(app.about)),
+        pystray.MenuItem("退出", handler(app.quit_app)),
     )
     icon = pystray.Icon(APP, img, "GHSpeed — GitHub 加速", menu)
     threading.Thread(target=icon.run, daemon=True).start()
@@ -377,7 +377,10 @@ def main():
     try:
         root = tk.Tk()
         app = App(root)
-        app.tray = setup_tray(app)
+        try:
+            app.tray = setup_tray(app)
+        except Exception:
+            app.tray = None   # 托盘初始化失败不能陪葬主窗口
         root.protocol("WM_DELETE_WINDOW", app.hide_to_tray)
         root.mainloop()
     except Exception:
