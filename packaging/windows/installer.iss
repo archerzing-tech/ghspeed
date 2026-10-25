@@ -23,7 +23,7 @@ Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
 OutputBaseFilename=GHSpeed-windows-setup-v{#AppVersion}
-OutputDir=dist
+OutputDir=..\..\dist
 UninstallDisplayName={#AppName}
 ChangesEnvironment=yes
 
@@ -32,9 +32,9 @@ Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: 
 Name: "addpath"; Description: "把命令行 ghspeed 加入 PATH(新开的终端生效)"; GroupDescription: "附加任务:"
 
 [Files]
-Source: "dist\GHSpeed.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "dist\ghspeed.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "README.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\..\dist\GHSpeed.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\..\dist\ghspeed.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"
