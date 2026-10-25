@@ -46,6 +46,9 @@ class App:
         self.mirror_btn = tk.Button(bar, text="镜像检测", width=10,
                                     command=self.check_mirrors)
         self.mirror_btn.pack(side="left")
+        self.diag_btn = tk.Button(bar, text="诊断", width=8,
+                                  command=self.run_diag)
+        self.diag_btn.pack(side="left", padx=8)
         self.about_btn = tk.Button(bar, text="关于", width=8, command=self.about)
         self.about_btn.pack(side="right")
 
@@ -176,6 +179,25 @@ class App:
             old, sys.stdout = sys.stdout, buf
             try:
                 eng.cmd_mirrors(None)
+            finally:
+                sys.stdout = old
+            text = buf.getvalue()
+            self.root.after(0, lambda: self.show_out(text))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def run_diag(self):
+        """多级通道自检:hosts/镜像池/ssh443/本地代理/DNS 一次看清"""
+        if self.busy:
+            return
+        self.set_busy(True)
+        self.status.config(text="⏳ 正在自检多级通道…", fg="#b58900")
+
+        def work():
+            buf = io.StringIO()
+            old, sys.stdout = sys.stdout, buf
+            try:
+                eng.cmd_status(None)
             finally:
                 sys.stdout = old
             text = buf.getvalue()

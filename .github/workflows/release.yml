@@ -146,6 +146,12 @@ jobs:
 
           注意:小写的 \`ghspeed.exe\` 是命令行版,双击只弹黑窗;图形界面请用 \`GHSpeed.exe\`
 
+          ### 多级可访问性阶梯(HTTPS 被掐时逐级退守)
+          1. hosts 钉 IP(候选含社区 hosts 源,验证后才入池)+ 动态镜像池(发布站拉取,逐个验证)
+          2. \`ghspeed ssh443 test\` → 通则 \`on\`:git 走 ssh.github.com:443,不走 TLS 无 SNI 可拦
+          3. \`ghspeed proxy\`:发现本机 Clash/V2Ray 端口给出只针对 GitHub 的接管命令;dl 支持 --proxy
+          4. \`ghspeed dns on|off\`:可选接管系统 DNS(备份自动还原);\`ghspeed status\` 一屏自检全部通道
+
           ### Linux / Debian(命令行,无 UI)
           ```
           sudo dpkg -i ghspeed_*_all.deb

@@ -92,7 +92,7 @@ sudo ghspeed off                 # 完全还原
 
 | 菜单项 | 说明 |
 |---|---|
-| 状态行 | 加速开关状态、固定域名数、github.com 实测延迟(5 分钟自动刷新) |
+| 状态行 | 加速开关状态、固定域名数、github.com 实测延迟(2 分钟自动刷新,失败自动重测自愈) |
 | 开启加速 / 关闭加速 | 核心开关;关闭完全还原 hosts 与定时任务 |
 | 立即测速刷新 | 手动重测一遍最优 IP |
 | 镜像检测… | 并发探测各镜像健康度与延迟 |
@@ -104,20 +104,45 @@ sudo ghspeed off                 # 完全还原
 
 ### Windows 简易界面
 
-双击 `GHSpeed_gui.pyw` 打开,按钮与 macOS 菜单一一对应:开启/关闭加速、立即测速刷新、镜像检测(结果直接显示在窗口里)、关于(版本号)。开启加速时弹 UAC 授权,提权后自动把开启做完。窗口关闭时最小化到系统托盘(装了 `pystray` 时),右键托盘图标退出。
+双击 `GHSpeed_gui.pyw` 打开,按钮与 macOS 菜单一一对应:开启/关闭加速、立即测速刷新、镜像检测(结果直接显示在窗口里)、诊断(hosts/镜像池/ssh443/本地代理/DNS 多级通道一次自检)、关于(版本号)。开启加速时弹 UAC 授权,提权后自动把开启做完。窗口关闭时最小化到系统托盘(装了 `pystray` 时),右键托盘图标退出。
 
 ### 命令行(三平台通用)
 
 ```
 ghspeed on | off          开启/关闭(还原 hosts 与定时任务)
-ghspeed status            查看固定 IP、延迟、守护状态
+ghspeed status            查看固定 IP、延迟、守护状态 + 多级通道自检
 ghspeed probe             手动测速(不写 hosts)
-ghspeed mirrors           镜像健康检查
+ghspeed mirrors           镜像健康检查(静态 + 动态池)
 ghspeed refresh           重测并更新 hosts(root / 管理员)
-ghspeed dl <url> [-o 路径] [--direct] [--min-speed KB/s]
+ghspeed dl <url> [-o 路径] [--direct] [--min-speed KB/s] [--proxy http://127.0.0.1:7890]
 ghspeed git on | off      git clone 走镜像(push 前记得 off)
+ghspeed ssh443 test|on|off   git 改走 ssh.github.com:443 官方备用 SSH 口
+ghspeed proxy             探测本机代理端口并给出接管命令(只检测,不接管)
+ghspeed dns on|off|show   系统 DNS 换干净公共 DNS(opt-in;off 原样还原)
 ghspeed --version         版本号
 ```
+
+## 多级可访问性阶梯(HTTPS 被掐时逐级退守)
+
+「有时候访问不了」通常不是一种病:链路好坏窗口摆动、SNI 阻断、DNS 污染各是各的。
+ghspeed 按阶梯逐级兜底,`ghspeed status` 一次看清各级状态:
+
+1. **hosts 钉 IP** —— 主通道。测速选最快 IP 写 hosts,30 分钟自动刷新;
+   候选 IP 除 DoH/内置网段外,还会拉**社区 hosts 源**(GitHub520/ineo6,6h 缓存),
+   但一律过 TLS+SNI 真实验证才可能被钉上
+2. **动态镜像池** —— 下载/clone 的备胎。发布站(ghproxy.link)+ 已知家族域名做候选,
+   拿真实 release 资产逐个验证,24h 缓存;发布站够不着时沿用旧池不洗空
+3. **ssh443** —— git 的活路。`ssh.github.com:443` 是 GitHub 官方备用 SSH 口,
+   **不走 TLS、没有 SNI 可拦**,HTTPS 被整段丢弃的坏窗口里它通常还活着
+   (先 `ghspeed ssh443 test` 验一把,通就 `on`,写入 `~/.ssh/config` 标记块,`off` 还原)
+4. **本地代理协作** —— 最后一级。`ghspeed proxy` 探测 Clash/V2Ray 常见端口,
+   发现了给出**只针对 GitHub** 的 git/下载接管命令;`ghspeed dl --proxy` 或
+   `GHSPEED_PROXY=...` 可把它作为下载链的最后一级兜底
+
+另有一个独立的可选开关:`ghspeed dns on` 把系统 DNS 换成国内不投毒的公共 DNS
+(阿里 223.5.5.5 / 腾讯 119.29.29.29), hosts 没钉到的域(如 `ssh.github.com`)
+和其他应用都能拿到真实解析;原配置备份在 `~/.ghspeed/dns_backup.json`,
+`ghspeed dns off` 原样还原(原来 DHCP 的还原成 DHCP)。影响全部网站,所以默认不动。
 
 自定义镜像列表:
 

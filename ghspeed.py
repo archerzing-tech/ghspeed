@@ -37,6 +37,7 @@ import platform as _platform
 
 IS_MAC = _platform.system() == "Darwin"
 IS_WIN = _platform.system() == "Windows"
+IS_LINUX = not IS_MAC and not IS_WIN
 
 if IS_WIN:
     import ctypes
@@ -79,9 +80,9 @@ REFRESH_INTERVAL = 1800  # 秒
 try:
     with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "VERSION")) as _f:
-        __version__ = _f.read().strip() or "0.2.1"
+        __version__ = _f.read().strip() or "0.3.0"
 except Exception:
-    __version__ = "0.2.1"
+    __version__ = "0.3.0"
 
 # 只处理这些 GitHub 域名,一个都不多
 DOMAINS = [
@@ -107,18 +108,44 @@ DOH_PROVIDERS = [
     "https://120.53.53.53/dns-query?name={d}&type=A",
 ]
 
-# 下载镜像(ghproxy 系),按顺序尝试(活的快的在前),最后直连兜底
+# 下载镜像(ghproxy 系)静态种子:冷启动/发布站也够不着时的保底
 MIRRORS = [
     "https://gh-proxy.com/",
     "https://ghproxy.net/",
     "https://ghfast.top/",
     "https://gh.llkk.cc/",
 ]
-# 自定义镜像(借鉴 fnos-store 的 custom mirror):逗号分隔,末尾带不带 / 均可
-#   GHSPEED_MIRRORS="https://mirror.example.com/,https://gh-proxy.com/" ghspeed dl <url>
-_env_mirrors = os.environ.get("GHSPEED_MIRRORS")
-if _env_mirrors:
-    MIRRORS = [m.strip().rstrip("/") + "/" for m in _env_mirrors.split(",") if m.strip()]
+
+# ---------------- 动态节点池(节点必须能定期更新,不能是死的) ----------------
+# 来源一律只当"候选":IP 要过 TLS+SNI 真实探测,镜像要能真实回源 release
+# 资产,验证不过的(无论静态还是动态)都不进推荐链。缓存按用户放
+# ~/.ghspeed/dyn.json,带 TTL;拉不到源就沿用旧池,永不因源挂而变残。
+
+USER_DYN_FILE = os.path.join(os.path.expanduser("~"), ".ghspeed", "dyn.json")
+
+# 镜像发布站:正文带当前可用镜像域名(页面改版也不怕,候选一律过验证)
+MIRROR_FEED_SOURCES = ["https://ghproxy.link/"]
+# 发布站页面是 JS 渲染的,静态抓只能看到零星几个,再把已知家族域名直接
+# 列为种子候选;入池前同样逐个验证,死了的自然进不来
+MIRROR_EXTRA_CANDIDATES = [
+    "https://ghp.ci/",
+    "https://ghproxy.cn/",
+    "https://ghproxy.cc/",
+    "https://gh-proxy.net/",
+    "https://ghproxy.homeboyc.cn/",
+]
+MIRROR_FEED_TTL = 86400      # 镜像池 24h 重拉
+
+# 社区 hosts 源:人工维护的新鲜 IP,作测速候选(GitHub520 官方分发 + ineo6 双路)
+HOSTS_FEED_SOURCES = [
+    "https://raw.hellogithub.com/hosts",
+    "https://cdn.jsdelivr.net/gh/ineo6/hosts/hosts",
+    "https://gitlab.com/ineo6/hosts/-/raw/master/hosts",
+]
+IP_FEED_TTL = 21600          # hosts 源 6h 重拉
+
+# 本地代理常见端口(Clash/Clash Verge/V2RayN/SSR…)——只检测并给出接管命令
+PROXY_PORTS = [7890, 7897, 7891, 1080, 2080, 8080, 8118, 10808, 10809, 8889]
 
 GITHUB_URL_RE = re.compile(
     r"^https?://([\w.-]*\.)?"
@@ -204,6 +231,140 @@ def load_seeds():
     return max(cands, key=lambda d: d.get("time", 0))
 
 
+# ---------------- 动态池:拉取 / 验证 / 缓存 ----------------
+
+
+def dyn_load():
+    try:
+        with open(USER_DYN_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def dyn_save(d):
+    try:
+        os.makedirs(os.path.dirname(USER_DYN_FILE), exist_ok=True)
+        tmp = USER_DYN_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(d, f, ensure_ascii=False)
+        os.replace(tmp, USER_DYN_FILE)
+    except Exception:
+        pass
+
+
+def fetch_url(url, timeout=8):
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "accept": "*/*"})
+    with urllib.request.urlopen(req, timeout=timeout, context=ssl_context()) as r:
+        return r.read(1 << 20).decode("utf-8", "replace")
+
+
+def validate_mirror(prefix, timeout=8):
+    """拿真实 release 资产过一遍镜像,HTTP 200 返回耗时,否则 None"""
+    try:
+        req = urllib.request.Request(prefix + MIRROR_TEST_URL,
+                                     headers={"User-Agent": UA}, method="HEAD")
+        t0 = time.perf_counter()
+        with urllib.request.urlopen(req, timeout=timeout, context=ssl_context()) as r:
+            r.read(0)
+            if r.getcode() != 200:
+                return None
+        return time.perf_counter() - t0
+    except Exception:
+        return None
+
+
+def mirror_pool(force=False):
+    """静态种子 + 发布站动态镜像(逐个验证过);24h 缓存,拉不到源沿用旧池"""
+    env = os.environ.get("GHSPEED_MIRRORS")
+    if env:   # 用户显式指定时完全尊重用户,不掺动态
+        return [m.strip().rstrip("/") + "/" for m in env.split(",") if m.strip()]
+    dyn = dyn_load()
+    cached = dyn.get("mirrors") or []
+    now = time.time()
+    if not force and cached and now - dyn.get("mirrors_ts", 0) < MIRROR_FEED_TTL:
+        return list(MIRRORS) + [m for m in cached if m not in MIRRORS]
+
+    pool = list(MIRRORS)
+    seen, cands, fetched = set(pool), [], False
+    for c in MIRROR_EXTRA_CANDIDATES:
+        if c not in seen:
+            seen.add(c)
+            cands.append(c)
+    for src in _env_csv("GHSPEED_MIRROR_FEEDS", MIRROR_FEED_SOURCES):
+        try:
+            html = fetch_url(src, timeout=8)
+            fetched = True
+        except Exception:
+            continue
+        for host in re.findall(r"https?://([a-zA-Z0-9.-]+)", html):
+            host = host.lower().rstrip(".")
+            if (re.search(r"gh|proxy|mirror", host)
+                    and not host.endswith(("github.com", "github.io",
+                                           "githubusercontent.com",
+                                           "githubassets.com", "ghproxy.link"))
+                    and host not in seen):
+                seen.add(host)
+                cands.append("https://%s/" % host)
+    if fetched:
+        alive = []
+        with cf.ThreadPoolExecutor(10) as ex:
+            for p, rtt in ex.map(lambda p: (p, validate_mirror(p)), cands[:24]):
+                if rtt is not None:
+                    alive.append(p)
+        if alive:
+            dyn["mirrors"], dyn["mirrors_ts"] = alive, now
+            dyn_save(dyn)
+            pool += [m for m in alive if m not in pool]
+        elif cached:   # 全验不过(疑似坏窗口):沿用旧池,别把空结果缓存 24h
+            pool += [m for m in cached if m not in pool]
+    elif cached:   # 发布站也够不着:沿用旧池,别把池子洗空
+        pool += [m for m in cached if m not in pool]
+    return pool
+
+
+def ip_feed_candidates(force=False):
+    """社区 hosts 源 → {domain: [ip,...]};6h 缓存,拉不到就吃缓存/返回空"""
+    dyn = dyn_load()
+    feeds = dyn.get("feed_ips") or {}
+    now = time.time()
+    if not force and feeds and now - dyn.get("ips_ts", 0) < IP_FEED_TTL:
+        return feeds
+    got = {}
+
+    def parse(text):
+        for line in text.splitlines():
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            parts = s.split()
+            if len(parts) >= 2 and re.match(r"^\d+\.\d+\.\d+\.\d+$", parts[0]):
+                ip, host = parts[0], parts[1].lower()
+                if host in DOMAINS:
+                    got.setdefault(host, [])
+                    if ip not in got[host]:
+                        got[host].append(ip)
+
+    def grab(src):
+        try:
+            parse(fetch_url(src, timeout=8))
+        except Exception:
+            pass
+
+    with cf.ThreadPoolExecutor(3) as ex:
+        list(ex.map(grab, HOSTS_FEED_SOURCES))
+    if got:
+        dyn["feed_ips"], dyn["ips_ts"] = got, now
+        dyn_save(dyn)
+        return got
+    return feeds
+
+
+def _env_csv(name, default):
+    v = os.environ.get(name)
+    return [x.strip() for x in v.split(",") if x.strip()] if v else default
+
+
 # ---------------- 测速 ----------------
 
 
@@ -271,8 +432,11 @@ def candidates_for(domain, cap=18):
             if x not in out:
                 out.append(x)
 
-    add(doh_lookup(domain))               # 实时解析优先(新鲜)
-    add(sorted(static_candidates(domain)))  # 内置兜底
+    add(doh_lookup(domain))                  # 实时解析优先(新鲜)
+    feeds = ip_feed_candidates().get(domain)  # 社区 hosts 源(人工维护的活 IP)
+    if feeds:
+        add(feeds)
+    add(sorted(static_candidates(domain)))   # 内置兜底
     return out[:cap]
 
 
@@ -614,6 +778,8 @@ def cmd_probe(args):
     save_state(state, dead)
     print("\n共 %d/%d 个域名可用,结果已缓存(启用请:sudo ghspeed on)"
           % (len(state), len(DOMAINS)))
+    threading.Thread(  # 顺手把动态镜像池/hosts 源缓存也焐热,dl 和 mirrors 直接受益
+        target=lambda: (mirror_pool(), ip_feed_candidates()), daemon=True).start()
 
 
 def cmd_on(args):
@@ -701,6 +867,35 @@ def cmd_status(args):
     except Exception as e:
         print("\n当前 github.com 访问失败:%s" % e)
 
+    # 多级通道自检:hosts / 镜像池 / ssh443 / 本地代理 / 系统 DNS
+    print("\n多级通道自检:")
+    print("  ① hosts 钉 IP    %s" % ("已开启,钉 %d 个域名" % len(in_hosts)
+          if in_hosts else "未开启"))
+    dyn = dyn_load()
+    cpool, cts = dyn.get("mirrors") or [], dyn.get("mirrors_ts")
+    feeds, fts = dyn.get("feed_ips") or {}, dyn.get("ips_ts")
+    print("  ② 下载镜像池     静态 %d + 动态 %d(池子 %s 验证);hosts 源 %d 条(%s)"
+          % (len(MIRRORS), len(cpool),
+             ("%.0f 小时前" % ((time.time() - cts) / 3600)) if cts else "尚未",
+             sum(len(v) for v in feeds.values()),
+             ("%.0f 小时前" % ((time.time() - fts) / 3600)) if fts else "尚未"))
+    try:
+        ssh_ips = doh_lookup("ssh.github.com") or [
+            socket.getaddrinfo("ssh.github.com", 443, socket.AF_INET,
+                               socket.SOCK_STREAM)[0][4][0]]
+        t0 = time.perf_counter()
+        socket.create_connection((ssh_ips[0], 443), timeout=2.5).close()
+        print("  ③ SSH 备用口 443 通(%s,%d ms)→ git 不顺时可:ghspeed ssh443 on"
+              % (ssh_ips[0], (time.perf_counter() - t0) * 1000))
+    except Exception:
+        print("  ③ SSH 备用口 443 不通(ghspeed ssh443 test 细查)")
+    found = detect_proxies(timeout=0.4)
+    print("  ④ 本地代理       %s" % (",".join(found) + "(ghspeed proxy detect 看接法)"
+          if found else "未发现常见端口"))
+    if not IS_LINUX:
+        print("  ⑤ 系统 DNS       %s" % ("已接管(dns off 还原)"
+              if os.path.exists(dns_backup_file()) else "未接管(可选:ghspeed dns on)"))
+
 
 # 真实 release 资产(借鉴 fnos-store mirrors.go 的测法):release 下载走
 # 独立后端,是镜像最容易"根路径活着但代理失败"的场景,必须拿真路径测
@@ -710,6 +905,11 @@ MIRROR_TEST_URL = ("https://github.com/jqlang/jq/releases/download/"
 
 def cmd_mirrors(args):
     print("镜像健康检查(HEAD 真实 release 资产 jq-linux-amd64):")
+    pool = mirror_pool()
+    dyn = set(dyn_load().get("mirrors") or []) - set(MIRRORS)
+    print("(池子:静态 %d + 动态 %d,动态来源 %s,均验证过)"
+          % (len(pool) - len(dyn & set(pool)), len(dyn & set(pool)),
+             "、".join(MIRROR_FEED_SOURCES)))
 
     def t(m):
         url = (m + MIRROR_TEST_URL) if m else MIRROR_TEST_URL
@@ -724,7 +924,7 @@ def cmd_mirrors(args):
         except Exception as e:
             return (None, None, str(e)[:60])
 
-    chain = MIRRORS + [None]
+    chain = pool + [None]
     results = []
     with cf.ThreadPoolExecutor(8) as ex:
         for m, (ms, code, err) in zip(chain, ex.map(t, chain)):
@@ -733,13 +933,16 @@ def cmd_mirrors(args):
     print()
     alive = []
     for m, ms, code, err in results:
-        name = "直连(吃 hosts 优化)" if m is None else urlparse(m).netloc
+        if m is None:
+            name = "直连(吃 hosts 优化)"
+        else:
+            name = urlparse(m).netloc + ("·动态" if m in dyn else "")
         if ms is not None:
-            print("  + %-26s %5.0f ms  HTTP %s" % (name, ms * 1000, code))
+            print("  + %-30s %5.0f ms  HTTP %s" % (name, ms * 1000, code))
             if m is not None and code == 200:
                 alive.append((ms, name))
         else:
-            print("  x %-26s %s" % (name, err))
+            print("  x %-30s %s" % (name, err))
 
     alive.sort()
     if alive:
@@ -748,14 +951,20 @@ def cmd_mirrors(args):
               "ghspeed dl <url>")
 
 
-def download_once(url, part_path, resume, min_speed=25.0, stall_s=12.0):
+def download_once(url, part_path, resume, min_speed=25.0, stall_s=12.0, proxy=None):
     """下载到 part_path;传输停滞或平均速度过低时抛异常,由上层换通道重试。"""
     headers = {"User-Agent": UA}
     offset = os.path.getsize(part_path) if resume and os.path.exists(part_path) else 0
     if offset:
         headers["Range"] = "bytes=%d-" % offset
     req = urllib.request.Request(url, headers=headers)
-    resp = urllib.request.urlopen(req, timeout=60, context=ssl_context())
+    if proxy:   # 最后一级通道:经本地 HTTP 代理(CONNECT)
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
+            urllib.request.HTTPSHandler(context=ssl_context()))
+        resp = opener.open(req, timeout=60)
+    else:
+        resp = urllib.request.urlopen(req, timeout=60, context=ssl_context())
     try:
         code = resp.getcode()
         if code not in (200, 206):
@@ -809,16 +1018,23 @@ def cmd_dl(args):
     if args.direct:
         chain = [None]
     else:
-        chain = [args.mirror] if args.mirror else list(MIRRORS)
+        chain = [args.mirror] if args.mirror else mirror_pool()
         chain.append(None)  # 直连兜底(hosts 已优化)
+    proxy = (args.proxy or os.environ.get("GHSPEED_PROXY", "")).strip() or None
+    if proxy:
+        chain.append("PROXY:" + proxy)   # 最后一级:本地代理
 
     for m in chain:
-        label = "直连" if m is None else urlparse(m).netloc
+        if m and m.startswith("PROXY:"):
+            real_url, prox, label = url, m[6:], "本地代理 %s" % m[6:]
+        else:
+            real_url, prox = (m + url) if m else url, None
+            label = "直连" if m is None else urlparse(m).netloc
         print("==> 尝试 %s" % label)
         try:
-            got, secs = download_once((m + url) if m else url, part,
+            got, secs = download_once(real_url, part,
                                       resume=os.path.exists(part),
-                                      min_speed=args.min_speed)
+                                      min_speed=args.min_speed, proxy=prox)
         except KeyboardInterrupt:
             print("\n已中断,断点保存在 %s,重跑同一命令可续传" % part)
             return
@@ -829,14 +1045,15 @@ def cmd_dl(args):
         print("完成 → %s (%s, 平均 %.2f MB/s)"
               % (out, human(got), got / max(secs, 1e-6) / 1e6))
         return
-    sys.exit("全部通道均失败;可稍后重试,或先运行 ghspeed mirrors 看看哪些镜像活着")
+    sys.exit("全部通道均失败;可稍后重试,或:① ghspeed mirrors 看镜像健康状况  "
+             "② ghspeed proxy detect 找本地代理后 GHSPEED_PROXY=... ghspeed dl ...")
 
 
 def cmd_git(args):
     if shutil.which("git") is None:
         sys.exit("未找到 git")
     if args.action == "on":
-        m = args.mirror or MIRRORS[0]
+        m = args.mirror or mirror_pool()[0]
         subprocess.run(["git", "config", "--global", "--replace-all",
                         "url.%shttps://github.com/.insteadOf" % m,
                         "https://github.com/"], check=True)
@@ -855,6 +1072,240 @@ def cmd_git(args):
                 print("已移除:%s" % key)
                 n += 1
         print("已关闭 git 镜像加速" if n else "本来就没有开启")
+
+
+# ---------------- ssh443:git 走官方备用 SSH 口 ----------------
+
+SSH_MARK_S = "# >>> ghspeed ssh443 >>>"
+SSH_MARK_E = "# <<< ghspeed ssh443 <<<"
+SSH_BLOCK = "\n".join([
+    SSH_MARK_S,
+    "Host github.com",
+    "  HostName ssh.github.com",
+    "  Port 443",
+    "  User git",
+    "  StrictHostKeyChecking accept-new",
+    SSH_MARK_E]) + "\n"
+
+
+def ssh_config_file():
+    return os.path.join(os.path.expanduser("~"), ".ssh", "config")
+
+
+def ssh_read_config():
+    try:
+        with open(ssh_config_file(), encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except Exception:
+        return ""
+
+
+def ssh_write_config(text):
+    p = ssh_config_file()
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    tmp = p + ".ghspeed.tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+    os.replace(tmp, p)
+    try:
+        os.chmod(p, 0o600)
+    except Exception:
+        pass
+
+
+def _ssh_try(*target):
+    """ssh -T 一把;GitHub 认证成功时故意返回 1,所以看输出不看退出码"""
+    cmd = ["ssh", "-T", "-o", "ConnectTimeout=8", "-o", "BatchMode=yes",
+           "-o", "StrictHostKeyChecking=accept-new"] + list(target)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except FileNotFoundError:
+        sys.exit("未找到 ssh 命令(Windows 请在「可选功能」里装 OpenSSH 客户端)")
+    except Exception:
+        r = None
+    out = ((r.stdout or "") + (r.stderr or "")).strip() if r else ""
+    ok = bool(re.search(r"Hi \S+!|successfully authenticated", out))
+    tail = out.splitlines()[-1] if out else "超时/拒绝"
+    print("  %-28s %s" % (" ".join(target), "通(%s)" % tail))
+    return ok
+
+
+def cmd_ssh443(args):
+    if args.action == "test":
+        print("SSH 通道测试(443 口不走 TLS,坏窗口里 HTTPS 被掐时的大概率活路):")
+        ssh_ok = _ssh_try("-p", "443", "git@ssh.github.com")
+        normal_ok = _ssh_try("git@github.com")
+        print()
+        if ssh_ok:
+            print("✅ ssh.github.com:443 可用 → ghspeed ssh443 on 一键启用,"
+                  "git 推拉自动改走 443 口")
+        elif normal_ok:
+            print("22 口可用、443 口不通,目前不必开启 ssh443")
+        else:
+            print("❌ 两个 SSH 口都不通;稍后再试,或临时用镜像:ghspeed git on")
+        return
+
+    cfg = ssh_read_config()
+    if args.action == "on":
+        outside = re.sub(re.escape(SSH_MARK_S) + r".*?" + re.escape(SSH_MARK_E),
+                         "", cfg, flags=re.S)
+        if re.search(r"(?mi)^\s*Host\s+\S*github", outside):
+            print("⚠️  %s 里已有你自己的 github.com 配置,ghspeed 不越权改动;" % ssh_config_file())
+            print("   请先手工合并,或注释掉那段后再运行 ghspeed ssh443 on")
+            return
+        if SSH_MARK_S in cfg:
+            new = re.sub(re.escape(SSH_MARK_S) + r".*?" + re.escape(SSH_MARK_E),
+                         SSH_BLOCK.strip(), cfg, flags=re.S)
+        else:
+            new = (cfg.rstrip("\n") + "\n\n" if cfg.strip() else "") + SSH_BLOCK
+        ssh_write_config(new)
+        print("已写入 %s:github.com 的 SSH 改走 ssh.github.com:443" % ssh_config_file())
+        print("验证:ghspeed ssh443 test;还原:ghspeed ssh443 off")
+    else:
+        if SSH_MARK_S in cfg:
+            new = re.sub(re.escape(SSH_MARK_S) + r".*?" + re.escape(SSH_MARK_E)
+                         + r"\n?", "", cfg, flags=re.S)
+            ssh_write_config(new)
+            print("已移除 ssh443 配置,git 恢复默认 22 口")
+        else:
+            print("本来就没有开启")
+
+
+# ---------------- 本地代理:只检测 + 给接管命令,不常驻不劫持 ----------------
+
+
+def detect_proxies(timeout=0.8):
+    """并发探测本机常见代理端口;CONNECT 通过才算数(SOCKS 口不认)"""
+    def t(port):
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=timeout) as s:
+                s.settimeout(3.0)
+                s.sendall(b"CONNECT github.com:443 HTTP/1.0\r\n\r\n")
+                if b" 200" in s.recv(64):
+                    return "http://127.0.0.1:%d" % port
+        except Exception:
+            pass
+        return None
+
+    with cf.ThreadPoolExecutor(len(PROXY_PORTS)) as ex:
+        return [p for p in ex.map(t, PROXY_PORTS) if p]
+
+
+def cmd_proxy(args):
+    print("探测本机常见代理端口:%s" % ", ".join(map(str, PROXY_PORTS)))
+    found = detect_proxies()
+    if not found:
+        print("未发现可用的本地 HTTP 代理口(SOCKS 口不认;Clash 开「混合端口」即可)")
+        print("知道端口的话可以直接用:")
+        print("  GHSPEED_PROXY=http://127.0.0.1:端口 ghspeed dl <url>")
+        return
+    print("可用代理:")
+    for p in found:
+        print("  + %s" % p)
+    p = found[0]
+    print("\n接法(只影响 GitHub,不动其他网站):")
+    print("  git:    git config --global http.https://github.com/.proxy %s" % p)
+    print("          取消:git config --global --unset http.https://github.com/.proxy")
+    print("  下载:   GHSPEED_PROXY=%s ghspeed dl <url>" % p)
+
+
+# ---------------- 系统 DNS:opt-in 全局接管,off 原样还原 ----------------
+
+DNS_CLEAN = ["223.5.5.5", "119.29.29.29"]   # 国内不投毒公共 DNS(阿里/腾讯)
+
+
+def dns_backup_file():
+    return os.path.join(os.path.expanduser("~"), ".ghspeed", "dns_backup.json")
+
+
+def _mac_dns_services():
+    r = subprocess.run(["networksetup", "-listallnetworkservices"],
+                       capture_output=True, text=True)
+    out = []
+    for line in (r.stdout or "").splitlines()[1:]:
+        line = line.strip()
+        if line and not line.startswith("*"):   # * 开头 = 已禁用的服务
+            out.append(line)
+    return out
+
+
+def cmd_dns(args):
+    if IS_LINUX:
+        sys.exit("Linux 的 DNS 管理各家发行版差异大,请手工改 /etc/resolv.conf 或 "
+                 "systemd-resolved;建议就填:%s" % " ".join(DNS_CLEAN))
+    if args.action == "show":
+        for svc, cur in _dns_current():
+            print("  %-24s %s" % (svc, " ".join(cur) if cur else "(自动获取/DHCP)"))
+        print("\n备份文件:%s%s" % (dns_backup_file(),
+              "(存在 → dns off 可还原)" if os.path.exists(dns_backup_file())
+              else "(不存在,说明没接管过)"))
+        return
+
+    items = _dns_current()
+    if args.action == "on":
+        if os.path.exists(dns_backup_file()):
+            sys.exit("已接管过(备份在 %s);重复接管会覆盖备份,先 dns off 再说" % dns_backup_file())
+        backup = [{"svc": s, "dns": cur} for s, cur in items]
+        os.makedirs(os.path.dirname(dns_backup_file()), exist_ok=True)
+        with open(dns_backup_file(), "w") as f:
+            json.dump({"time": time.time(), "platform": _platform.system(),
+                       "items": backup}, f, ensure_ascii=False, indent=1)
+        for s, _ in items:
+            _dns_apply(s, DNS_CLEAN)
+        print("已把系统 DNS 换成 %s(原配置备份在 %s)" % (" ".join(DNS_CLEAN), dns_backup_file()))
+        print("影响全部网站(不只 GitHub);还原:ghspeed dns off")
+    else:
+        try:
+            with open(dns_backup_file()) as f:
+                backup = json.load(f).get("items", [])
+        except Exception:
+            sys.exit("没有备份文件(从没 dns on 过),不知道该还原成什么;拒绝瞎猜")
+        for item in backup:
+            _dns_apply(item["svc"], item["dns"])
+        os.remove(dns_backup_file())
+        print("已按备份还原系统 DNS")
+
+
+def _dns_current():
+    """[(服务/适配器名, 当前 DNS 列表或 None=自动获取)]"""
+    out = []
+    if IS_MAC:
+        for svc in _mac_dns_services():
+            r = subprocess.run(["networksetup", "-getdnsservers", svc],
+                               capture_output=True, text=True)
+            txt = (r.stdout or "").strip()
+            if txt.startswith("There aren't any DNS Servers"):
+                out.append((svc, None))
+            else:
+                out.append((svc, txt.split()))
+    elif IS_WIN:
+        ps = ("Get-DnsClientServerAddress -AddressFamily IPv4 | "
+              "Where-Object {$_.ServerAddresses} | "
+              "Select-Object InterfaceAlias,@{n='d';e={$_.ServerAddresses -join ','}} | "
+              "ConvertTo-Json -Compress")
+        r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                           capture_output=True, text=True)
+        try:
+            data = json.loads(r.stdout or "[]")
+            if isinstance(data, dict):
+                data = [data]
+            for it in data or []:
+                out.append((it["InterfaceAlias"], it["d"].split(",")))
+        except Exception:
+            pass
+    return out
+
+
+def _dns_apply(svc, servers):
+    if IS_MAC:
+        cmd = ["networksetup", "-setdnsservers", svc] + (servers or ["Empty"])
+        subprocess.run(cmd, capture_output=True, text=True)
+    elif IS_WIN:
+        ps = ("Set-DnsClientServerAddress -InterfaceAlias '%s' " % svc.replace("'", "''")
+              + ("-ServerAddresses (%s)" % ",".join("'%s'" % d for d in servers)
+                 if servers else "-ResetServerAddresses"))
+        subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                       capture_output=True, text=True)
 
 
 def cmd_install(args):
@@ -904,6 +1355,8 @@ def main():
     p.add_argument("-o", "--output", help="保存路径(默认取 URL 文件名)")
     p.add_argument("--mirror", help="指定镜像前缀")
     p.add_argument("--direct", action="store_true", help="不走镜像,只直连")
+    p.add_argument("--proxy", help="本地 HTTP 代理兜底,如 http://127.0.0.1:7890"
+                   "(也可用环境变量 GHSPEED_PROXY)")
     p.add_argument("--min-speed", type=float, default=25.0, metavar="KB/S",
                    help="平均速度低于此值就自动换下一个通道(0=不检查,默认 25)")
     p.set_defaults(func=cmd_dl)
@@ -912,6 +1365,17 @@ def main():
     p.add_argument("action", choices=["on", "off"])
     p.add_argument("--mirror", help="指定镜像前缀")
     p.set_defaults(func=cmd_git)
+
+    p = sub.add_parser("ssh443", help="git 改走 ssh.github.com:443 官方备用口(HTTPS 被掐时的活路)")
+    p.add_argument("action", choices=["on", "off", "test"])
+    p.set_defaults(func=cmd_ssh443)
+
+    sub.add_parser("proxy", help="探测本机代理端口并给出接管命令(只检测,不接管)"
+                   ).set_defaults(func=cmd_proxy)
+
+    p = sub.add_parser("dns", help="系统 DNS 换成干净公共 DNS(opt-in,影响全部网站;off 原样还原)")
+    p.add_argument("action", choices=["on", "off", "show"])
+    p.set_defaults(func=cmd_dns)
 
     if IS_WIN and len(sys.argv) == 1:
         # 双击 ghspeed.exe 时别让黑窗一闪而过:打印帮助后等回车
