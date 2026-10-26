@@ -82,9 +82,9 @@ REFRESH_INTERVAL = 1800  # 秒
 try:
     with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "VERSION")) as _f:
-        __version__ = _f.read().strip() or "0.4.7"
+        __version__ = _f.read().strip() or "0.4.8"
 except Exception:
-    __version__ = "0.4.7"
+    __version__ = "0.4.8"
 
 # 只处理这些 GitHub 域名,一个都不多
 DOMAINS = [
@@ -1796,6 +1796,7 @@ _SNI_DIR = os.path.join(_sni_home(), ".ghspeed")
 SNI_PAC = os.path.join(_SNI_DIR, "ghspeed.pac")
 SNI_CFG = os.path.join(_SNI_DIR, "sni.json")
 SNI_PID = os.path.join(_SNI_DIR, "sni.pid")
+SNI_STOP = os.path.join(_SNI_DIR, "sni.stop")   # 协作停止哨兵:relay 轮询到即自停
 SNI_STRATS = ("direct", "split1", "snisplit", "disorder")
 
 
@@ -2035,34 +2036,80 @@ class _SniHandler(socketserver.BaseRequestHandler):
         return data
 
 
-def sni_serve():
-    os.makedirs(os.path.dirname(SNI_PID), exist_ok=True)
+_SNI_SERVER = None   # 本进程内 relay 的服务对象(同进程可一键停,GUI 内嵌场景)
+
+
+def _sni_run_server():
+    """绑定端口并后台跑 relay;返回 (server, thread),绑定失败(被占)返回 None。
+    启动即清掉陈年 stop 哨兵——标记只在 relay 活着期间有效"""
+    global _SNI_SERVER
     try:
         srv = _SniServer(("127.0.0.1", SNI_PORT), _SniHandler)
-    except OSError as e:
-        sys.exit("relay 启动失败:%s(端口 %d 被占?)" % (e, SNI_PORT))
-    with open(SNI_PID, "w") as f:
-        f.write(str(os.getpid()))
+    except OSError:
+        return None
+    _SNI_SERVER = srv
     try:
-        srv.serve_forever()
-    finally:
-        try:
-            os.remove(SNI_PID)
-        except Exception:
-            pass
+        os.remove(SNI_STOP)
+    except OSError:
+        pass
+    try:
+        with open(SNI_PID, "w") as f:
+            f.write(str(os.getpid()))
+    except Exception:
+        pass
+    th = threading.Thread(target=srv.serve_forever,
+                          kwargs={"poll_interval": 0.3}, daemon=True)
+    th.start()
+    return srv, th
+
+
+def _sni_wait_stop(srv, th):
+    """阻塞到 stop 哨兵出现或 relay 线程自然退出,然后收尾"""
+    while th.is_alive() and not os.path.exists(SNI_STOP):
+        th.join(0.4)
+    if th.is_alive():
+        srv.shutdown()          # 从别的线程停 serve_forever,安全
+    try:
+        os.remove(SNI_PID)
+    except OSError:
+        pass
+    try:
+        os.remove(SNI_STOP)
+    except OSError:
+        pass
+
+
+def sni_serve():
+    os.makedirs(_SNI_DIR, exist_ok=True)
+    r = _sni_run_server()
+    if r is None:
+        sys.exit("relay 启动失败:端口 %d 被占?" % SNI_PORT)
+    _sni_wait_stop(*r)
 
 
 def sni_start_inproc():
     """GUI 用:进程内起 relay 线程;端口已被占(独立 relay 在跑)则静默让位"""
     def run():
-        try:
-            srv = _SniServer(("127.0.0.1", SNI_PORT), _SniHandler)
-            with open(SNI_PID, "w") as f:
-                f.write(str(os.getpid()))
-            srv.serve_forever()
-        except OSError:
-            pass
+        r = _sni_run_server()
+        if r is None:
+            return
+        _sni_wait_stop(*r)
     threading.Thread(target=run, daemon=True).start()
+
+
+def sni_request_stop():
+    """停 relay 的统一入口:写哨兵(独立进程轮询自停)+ 直接停本进程内线程"""
+    try:
+        with open(SNI_STOP, "w") as f:
+            f.write(str(os.getpid()))
+    except Exception:
+        pass
+    srv = _SNI_SERVER
+    if srv is not None:
+        try:
+            srv.shutdown()
+        except Exception:
+            pass
 
 
 def _sni_relay_alive():
@@ -2104,6 +2151,10 @@ def _sni_spawn_relay():
 
 
 def _sni_stop_relay():
+    """停 relay:先协作停止(哨兵+同进程 shutdown),再按 pid 补刀;
+    端口 3 秒内还不放就按命令行特征来一次(仅一次——wmic 在 Windows 上
+    一次 5~10 秒且新 Win11 已移除,循环重试会把「关闭加速」冻住几分钟)"""
+    sni_request_stop()
     pid = None
     try:
         with open(SNI_PID) as f:
@@ -2122,20 +2173,28 @@ def _sni_stop_relay():
         os.remove(SNI_PID)
     except Exception:
         pass
-    # 兜底:pidfile 没对上号(重启/竞态/残留)时,按命令行特征清扫到端口真正释放
-    for _ in range(10):
+    for _ in range(12):
         if not _sni_relay_alive():
+            try:
+                os.remove(SNI_STOP)
+            except OSError:
+                pass
             return
-        try:
-            if IS_WIN:
-                subprocess.run(["wmic", "process", "where",
-                                "CommandLine like '%sni serve%'", "call", "terminate"],
-                               capture_output=True)
-            else:
-                subprocess.run(["pkill", "-f", "sni serve"], capture_output=True)
-        except Exception:
-            pass
-        time.sleep(0.3)
+        time.sleep(0.25)
+    try:   # 罕见:外部孤儿(不是我们起的)。补一刀;再不行就靠 DIRECT 兜底
+        if IS_WIN:
+            subprocess.run(["wmic", "process", "where",
+                            "CommandLine like '%sni serve%'", "call", "terminate"],
+                           capture_output=True)
+        else:
+            subprocess.run(["pkill", "-f", "sni serve"], capture_output=True)
+    except Exception:
+        pass
+    time.sleep(0.6)
+    try:
+        os.remove(SNI_STOP)
+    except OSError:
+        pass
 
 
 # ---- 系统 PAC 设置(mac:networksetup 要管理员;win:HKCU 注册表免管理员)----
