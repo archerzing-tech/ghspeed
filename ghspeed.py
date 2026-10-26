@@ -2122,6 +2122,20 @@ def _sni_stop_relay():
         os.remove(SNI_PID)
     except Exception:
         pass
+    # 兜底:pidfile 没对上号(重启/竞态/残留)时,按命令行特征清扫到端口真正释放
+    for _ in range(10):
+        if not _sni_relay_alive():
+            return
+        try:
+            if IS_WIN:
+                subprocess.run(["wmic", "process", "where",
+                                "CommandLine like '%sni serve%'", "call", "terminate"],
+                               capture_output=True)
+            else:
+                subprocess.run(["pkill", "-f", "sni serve"], capture_output=True)
+        except Exception:
+            pass
+        time.sleep(0.3)
 
 
 # ---- 系统 PAC 设置(mac:networksetup 要管理员;win:HKCU 注册表免管理员)----
