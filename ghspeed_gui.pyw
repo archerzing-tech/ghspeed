@@ -40,16 +40,19 @@ class App:
 
         bar = tk.Frame(root)
         bar.pack(fill="x", padx=10, pady=(8, 4))
-        self.toggle_btn = tk.Button(bar, text="开启加速", width=9, command=self.toggle)
+        # 不写死 width:Tk 的 width 以字符为单位,中文标签会被截断,
+        # 交给 Tk 按最长标签自动撑开,padx 留出左右呼吸空间。
+        self.toggle_btn = tk.Button(bar, text="开启加速", padx=8, command=self.toggle)
         self.toggle_btn.pack(side="left")
-        self.refresh_btn = tk.Button(bar, text="测速刷新", width=8,
+        self.refresh_btn = tk.Button(bar, text="测速刷新", padx=8,
                                      command=self.refresh_now)
         self.refresh_btn.pack(side="left", padx=(6, 0))
-        self.dns_btn = tk.Button(bar, text="DNS", width=5, command=self.toggle_dns)
+        self.dns_btn = tk.Button(bar, text="DNS 接管", padx=8,
+                                 command=self.toggle_dns)
         self.dns_btn.pack(side="left", padx=(6, 0))
-        self.sni_btn = tk.Button(bar, text="SNI", width=5, command=self.toggle_sni)
+        self.sni_btn = tk.Button(bar, text="SNI 分片", padx=8, command=self.toggle_sni)
         self.sni_btn.pack(side="left", padx=(6, 0))
-        self.diag_btn = tk.Button(bar, text="诊断", width=6, command=self.run_diag)
+        self.diag_btn = tk.Button(bar, text="诊断", padx=8, command=self.run_diag)
         self.diag_btn.pack(side="left", padx=(6, 0))
 
         self.out = ScrolledText(root, height=8, font=("Consolas", 9),
