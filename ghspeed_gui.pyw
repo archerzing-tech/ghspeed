@@ -94,28 +94,34 @@ class App:
         threading.Thread(target=self._latency_worker, daemon=True).start()
 
     def _latency_worker(self):
-        ms = self._measure()
+        ms, via = self._measure()
         try:
             dns_real = eng.dns_is_on()   # 真实系统态;备份文件落在谁家不该决定按钮
         except Exception:
             dns_real = self.dns_on()
-        self.root.after(0, lambda: self._lat_done(ms, dns_real))
+        self.root.after(0, lambda: self._lat_done(ms, via, dns_real))
 
-    def _lat_done(self, ms, dns_real):
-        self.latency.config(text=("github.com:%d ms" % ms) if ms >= 0
-                            else "github.com:当前直连不通(建议开启加速)")
+    def _lat_done(self, ms, via, dns_real):
+        if ms >= 0:   # 与 macOS 菜单栏同一套少喊狼逻辑:单域被掐 ≠ 整站不可用
+            self.latency.config(
+                text="github.com:%d ms" % ms if via == "github.com"
+                else "github.com 波动中(%s %d ms 可用)" % (via, ms))
+        else:
+            self.latency.config(text="github.com:当前直连不通(建议开启加速)")
         self.dns_btn.config(text="DNS 还原" if dns_real else "DNS 接管")
 
     @staticmethod
     def _measure():
-        try:
-            ips = socket.getaddrinfo("github.com", 443, socket.AF_INET,
-                                     socket.SOCK_STREAM)
-            t0 = time.perf_counter()
-            eng.probe("github.com", ips[0][4][0], timeout=4)
-            return int((time.perf_counter() - t0) * 1000)
-        except Exception:
-            return -1
+        for d in ("github.com", "api.github.com", "codeload.github.com"):
+            try:
+                ips = socket.getaddrinfo(d, 443, socket.AF_INET,
+                                         socket.SOCK_STREAM)
+                t0 = time.perf_counter()
+                eng.probe(d, ips[0][4][0], timeout=4)
+                return int((time.perf_counter() - t0) * 1000), d
+            except Exception:
+                continue
+        return -1, ""
 
     def set_busy(self, b):
         self.busy = b

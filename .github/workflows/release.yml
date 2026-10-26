@@ -155,6 +155,7 @@ jobs:
           ### 多级可访问性阶梯(HTTPS 被掐时逐级退守)
           1. hosts 钉 IP(候选含社区 hosts 源,验证后才入池)+ 动态镜像池(发布站拉取,
              逐个验证,下单顺序按实测延迟排)
+          1.5 下载分片并行:≥8MB 自动切 8 片、轮转多通道,片级断点续传,失败退回单流链
           2. \`ghspeed ssh443 test\` → 通则 \`on\`:git 走 ssh.github.com:443,不走 TLS 无 SNI 可拦
           3. \`ghspeed proxy\`:发现本机 Clash/V2Ray 端口给出只针对 GitHub 的接管命令;dl 支持 --proxy
           4. \`ghspeed dns on|off\`:可选接管系统 DNS(状态读系统真实 DNS,UI 按真实状态切换;

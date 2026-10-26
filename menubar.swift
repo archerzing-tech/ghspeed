@@ -182,6 +182,25 @@ func latestAction() -> String? {
     return "\(ts) \(act) \(detail)".trimmingCharacters(in: .whitespaces)
 }
 
+// 探测时间线写进 activity.log(仅坏窗口 开始/结束 各一笔;「最近」行与 ghspeed activity 都能看到)
+func appendProbeJournal(_ detail: String) {
+    let obj: [String: Any] = ["t": Date().timeIntervalSince1970,
+                              "action": "probe", "detail": detail]
+    guard let d = try? JSONSerialization.data(withJSONObject: obj),
+          let line = String(data: d, encoding: .utf8) else { return }
+    let dir = NSHomeDirectory() + "/.ghspeed"
+    try? FileManager.default.createDirectory(atPath: dir,
+                                             withIntermediateDirectories: true)
+    let path = dir + "/activity.log"
+    if let fh = FileHandle(forWritingAtPath: path) {
+        defer { try? fh.close() }
+        fh.seekToEndOfFile()
+        fh.write((line + "\n").data(using: .utf8)!)
+    } else {
+        try? (line + "\n").write(toFile: path, atomically: true, encoding: .utf8)
+    }
+}
+
 // 实测 GitHub 延迟:github.com → api → codeload 逐个试(都是钉选域;
 // raw/gist 本网永久 SNI 阻断,不探)。谁通算谁——github.com 单域被掐
 // ≠ 整站不可用,别动不动喊"链路波动"。全都不通才返回 nil
@@ -224,6 +243,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var lastHeal = Date.distantPast   // 坏窗口自动重测的限流
     var lastAllDown = false           // 上一轮是否整段不通(决定 30s 加密复查)
     var githubDownStreak = 0          // github.com 连续被掐的轮数(≥2 触发自愈)
+    var journalDown = false           // 波动时间线:当前是否处于坏窗口(只记翻转)
+    var downSince = Date()            // 坏窗口起点(算持续时长)
+    var sshSuggested = false          // ssh443 建议每次运行只提一次,别刷屏
     var liveItem: NSMenuItem!
     var recentItem: NSMenuItem!
     var liveCount = 0
@@ -352,9 +374,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self.latencyLine.title = "github.com:当前直连不通(建议开启加速)"
                     self.lastAllDown = false
                 }
+                self.logProbeTransition(allDown: self.lastAllDown)   // 波动时间线(只记翻转)
                 self.autoHealIfNeeded()
                 self.armTimer(self.lastAllDown ? 30 : 120)   // 坏窗口期 30 秒一测,快点走出去
             }
+        }
+    }
+
+    // 波动时间线:只在 翻转/恢复 边界记一笔 probe 行(activity.log,ghspeed activity 可回放)
+    func logProbeTransition(allDown: Bool) {
+        guard hostsOn().on else { return }   // 只在开启加速期间有意义
+        if allDown && !journalDown {
+            journalDown = true
+            downSince = Date()
+            appendProbeJournal("坏窗口开始(三域全不通,自愈中)")
+        } else if !allDown && journalDown {
+            journalDown = false
+            appendProbeJournal("坏窗口结束,持续 \(Int(Date().timeIntervalSince(downSince))) 秒")
         }
     }
 
@@ -379,7 +415,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if r.code == 0 {
                 notify("GitHub 加速", "检测到链路波动,已自动重测并更新最优 IP")
             }
+            self?.suggestSsh443IfNeeded()
             DispatchQueue.main.async { self?.refreshUI() }
+        }
+    }
+
+    // HTTPS 坏窗口反复时,若 SSH 443 通道可用且还没开 → 建议一句。
+    // ssh.github.com:443 走 SSH 协议,没有 TLS/SNI,对这类波动免疫(阶梯第 2 级)
+    func suggestSsh443IfNeeded() {
+        guard !sshSuggested else { return }
+        let cfg = (try? String(contentsOfFile: NSHomeDirectory() + "/.ssh/config",
+                               encoding: .utf8)) ?? ""
+        if cfg.contains(">>> ghspeed ssh443 >>>") { return }   // 已开启
+        let t = runShell(engineUserCmd(["ssh443", "test"]), timeout: 60)
+        guard t.out.contains("Hi ") || t.out.contains("successfully authenticated")
+        else { return }                                        // 备用口不通,不推荐
+        sshSuggested = true
+        DispatchQueue.main.async {
+            notify("GitHub 加速",
+                   "HTTPS 波动反复,但 SSH 443 通道可用 —— 建议开启:"
+                   + "ghspeed ssh443 on(git 场景免疫此类波动)")
         }
     }
 

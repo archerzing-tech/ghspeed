@@ -21,7 +21,8 @@ GitHub 加速工具:测速固定最快 IP + 镜像加速下载,只解决 GitHub 
 ## 它解决什么
 
 1. **加快访问 github** — 并发探测已知 GitHub 网段 + DoH 解析结果,按域名做 TLS 握手测速(证书验证防污染 IP),把最快 IP 写入 hosts 标记块,并装定时任务每 30 分钟自动重测换优
-2. **加速 GitHub 下载** — ghproxy 系镜像回退链 + 直连兜底,停滞/低速自动换通道,支持 Range 断点续传
+2. **加速 GitHub 下载** — ≥8MB 自动切 8 片、多通道并行(每片独立选镜像/直连,片级断点续传);
+   小文件走 ghproxy 系镜像回退链 + 直连兜底,停滞/低速自动换通道
 3. **打不开变能打开** — 链路在好坏窗口间摆动(TCP 通、TLS 间歇被丢)时,测速器跨窗口多轮重试,好窗口一到就把 IP 钉住
 
 三平台同一份 Python 引擎(`ghspeed.py`),hosts / 定时刷新 / DNS 缓存 / 提权方式按平台自动适配(launchd / systemd / 计划任务)。
@@ -118,6 +119,7 @@ ghspeed probe             手动测速(不写 hosts)
 ghspeed mirrors           镜像健康检查(静态 + 动态池)
 ghspeed refresh           重测并更新 hosts(root / 管理员)
 ghspeed dl <url> [-o 路径] [--direct] [--min-speed KB/s] [--proxy http://127.0.0.1:7890]
+                          （≥8MB 自动切 8 片多通道并行下载,片级断点续传,失败退回单流链)
 ghspeed git on | off      git clone 走镜像(push 前记得 off)
 ghspeed ssh443 test|on|off   git 改走 ssh.github.com:443 官方备用 SSH 口
 ghspeed proxy             探测本机代理端口并给出接管命令(只检测,不接管)

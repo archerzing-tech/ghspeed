@@ -27,6 +27,7 @@ import socket
 import ssl
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from urllib.parse import urlparse, unquote
@@ -80,9 +81,9 @@ REFRESH_INTERVAL = 1800  # 秒
 try:
     with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "VERSION")) as _f:
-        __version__ = _f.read().strip() or "0.4.5"
+        __version__ = _f.read().strip() or "0.4.6"
 except Exception:
-    __version__ = "0.4.5"
+    __version__ = "0.4.6"
 
 # 只处理这些 GitHub 域名,一个都不多
 DOMAINS = [
@@ -1141,6 +1142,178 @@ def download_once(url, part_path, resume, min_speed=25.0, stall_s=12.0, proxy=No
         resp.close()
 
 
+SHARD_MIN_TOTAL = 8 << 20   # ≥8MB 才值得分片(GHSPEED_SHARD_MB 可调)
+SHARD_MIN_SIZE = 1 << 20    # 每片至少 1MB
+SHARD_MAX = 8               # 最多 8 片,片号轮转分给不同通道
+
+
+class ShardedSkip(Exception):
+    """不满足分片条件(小文件/探测不到大小),上层退回单流链"""
+
+
+def _dl_target(m, url):
+    """chain 元素 → (实际 URL, 代理或 None)"""
+    if m and m.startswith("PROXY:"):
+        return url, m[6:]
+    return ((m + url) if m else url), None
+
+
+def _dl_open(u, headers, prox, timeout=30):
+    req = urllib.request.Request(u, headers=headers)
+    if prox:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": prox, "https": prox}),
+            urllib.request.HTTPSHandler(context=ssl_context()))
+        return opener.open(req, timeout=timeout)
+    return urllib.request.urlopen(req, timeout=timeout, context=ssl_context())
+
+
+def download_sharded(url, part, chain, min_speed=25.0, stall_s=12.0):
+    """分片并行下载:文件 ≥8MB 时切 ≤8 片,片号轮转分给链上不同通道,
+    每片自带 Range 续传与停滞跳道,片失败自动换下一通道接剩余区间。
+    片级断点:<part>.shards.json 记录每片完成字节,重跑同命令自动续。
+    返回 (本次字节, 秒);条件不满足抛 ShardedSkip(退回单流链)。"""
+    try:
+        mb = float(os.environ.get("GHSPEED_SHARD_MB", SHARD_MIN_TOTAL >> 20))
+        threshold = int(mb * (1 << 20))
+    except ValueError:
+        threshold = SHARD_MIN_TOTAL
+    # —— 探测:找第一个能报出大小的通道;小文件直接交回单流 ——
+    head, total = None, 0
+    for m in chain:
+        if m is None or (m and m.startswith("PROXY:")):
+            continue   # 直连/代理不定大小门槛,仅作片通道用
+        real_url, prox = _dl_target(m, url)
+        try:
+            with _dl_open(real_url, {"User-Agent": UA}, prox, timeout=8) as r:
+                if r.getcode() == 200:
+                    total = int(r.headers.get("Content-Length") or 0)
+        except Exception:
+            continue
+        if total >= threshold:
+            head = m
+            break
+        if total:
+            raise ShardedSkip("文件仅 %s" % human(total))
+    if not head or total <= 0:
+        raise ShardedSkip("探测不到文件大小")
+
+    n = min(SHARD_MAX, max(1, total // SHARD_MIN_SIZE))
+    bounds = [total * i // n for i in range(n + 1)]
+    side = part + ".shards.json"
+    done = [0] * n
+    try:
+        with open(side) as f:
+            state = json.load(f)
+        if (state.get("url") == url and state.get("size") == total
+                and isinstance(state.get("done"), list)
+                and len(state["done"]) == n):
+            done = [max(0, min(int(x), bounds[i + 1] - bounds[i]))
+                    for i, x in enumerate(state["done"])]
+    except Exception:
+        pass
+    if not os.path.exists(part) or os.path.getsize(part) != total:
+        with open(part, "wb") as f:
+            f.truncate(total)
+
+    stop = threading.Event()
+    lock = threading.Lock()
+    ptr = [0]
+
+    def next_mi():
+        with lock:
+            mi = ptr[0]
+            ptr[0] = (ptr[0] + 1) % len(chain)
+            return mi
+
+    def save_side():
+        with lock:
+            try:
+                with open(side, "w") as f:
+                    json.dump({"url": url, "size": total, "done": done}, f)
+            except Exception:
+                pass
+
+    def work(i):
+        lo, hi = bounds[i], bounds[i + 1] - 1
+        with open(part, "r+b") as f:
+            tried = 0
+            while not stop.is_set():
+                m = chain[next_mi()]
+                if m is None or m.startswith("PROXY:"):
+                    tried += 1
+                    if tried >= len(chain) * 2:
+                        raise RuntimeError("片 %d 无通道可用" % i)
+                    continue
+                real_url, prox = _dl_target(m, url)
+                pos = lo + done[i]
+                try:
+                    with _dl_open(real_url, {"User-Agent": UA,
+                                             "Range": "bytes=%d-%d" % (pos, hi)},
+                                  prox) as r:
+                        if r.getcode() != 206:
+                            raise RuntimeError("HTTP %s(通道不支持 Range)"
+                                               % r.getcode())
+                        last = time.time()
+                        while not stop.is_set():
+                            chunk = r.read(1 << 16)
+                            if not chunk:
+                                break
+                            chunk = chunk[:hi + 1 - pos]
+                            f.seek(pos)
+                            f.write(chunk)
+                            pos += len(chunk)
+                            done[i] += len(chunk)
+                            last = time.time()
+                        if pos > hi:
+                            save_side()
+                            return
+                        raise RuntimeError("片 %d 提前断流" % i)
+                except Exception:
+                    tried += 1
+                    if tried >= len(chain) * 2 or stop.is_set():
+                        raise RuntimeError("片 %d 无通道可用" % i)
+                    time.sleep(0.3)
+        raise RuntimeError("片 %d 被中止" % i)
+
+    t0 = time.time()
+    got0 = sum(done)
+    with cf.ThreadPoolExecutor(min(n, SHARD_MAX)) as ex:
+        futs = {ex.submit(work, i): i for i in range(n)
+                if done[i] < bounds[i + 1] - bounds[i]}
+        try:
+            while futs:
+                time.sleep(0.8)
+                for f in [f for f in futs if f.done()]:
+                    f.result()          # worker 异常在这里浮出
+                    del futs[f]
+                sec = time.time() - t0
+                if sec > 0.8:
+                    print("\r    %s / %s  %.2f MB/s(分片×%d)"
+                          % (human(sum(done)), human(total),
+                             (sum(done) - got0) / sec / 1e6, n),
+                          end="", flush=True)
+                if (min_speed and sec > 30
+                        and (sum(done) - got0) / 1024 / sec < min_speed
+                        and sum(done) < total):
+                    raise RuntimeError("平均速度低于 %.0f KB/s" % min_speed)
+            print()
+        except BaseException:
+            stop.set()
+            print()
+            if not isinstance(sys.exc_info()[1], KeyboardInterrupt):
+                try:                    # 真失败:清现场,单流链从头来
+                    os.remove(side)
+                except OSError:
+                    pass
+                try:
+                    os.remove(part)
+                except OSError:
+                    pass
+            raise
+    return sum(done) - got0, time.time() - t0
+
+
 def cmd_dl(args):
     url = args.url.strip()
     if not GITHUB_URL_RE.match(url):
@@ -1159,29 +1332,64 @@ def cmd_dl(args):
     if proxy:
         chain.append("PROXY:" + proxy)   # 最后一级:本地代理
 
-    for m in chain:
-        if m and m.startswith("PROXY:"):
-            real_url, prox, label = url, m[6:], "本地代理 %s" % m[6:]
-        else:
-            real_url, prox = (m + url) if m else url, None
-            label = "直连" if m is None else urlparse(m).netloc
-        print("==> 尝试 %s" % label)
-        try:
-            got, secs = download_once(real_url, part,
-                                      resume=os.path.exists(part),
-                                      min_speed=args.min_speed, proxy=prox)
-        except KeyboardInterrupt:
-            print("\n已中断,断点保存在 %s,重跑同一命令可续传" % part)
-            return
-        except Exception as e:
-            print("    失败:%s" % e)
-            continue
+    # —— 分片并行快路:≥8MB 自动切 8 片轮转多通道,片级断点续传 ——
+    print("==> 分片并行(自动多通道)")
+    try:
+        got, secs = download_sharded(url, part, chain, min_speed=args.min_speed)
+    except ShardedSkip as e:
+        print("    (%s,改走单流链)" % e)
+    except KeyboardInterrupt:
+        print("\n已中断,分片断点保存在 %s,重跑同一命令可续传" % part)
+        return
+    except Exception as e:
+        print("    分片并行失败:%s → 退回单流链" % e)
+        # 分片留下的 part 是按总大小预分配的稀疏文件,不是连续前缀——
+        # 单流的"按 part 大小续传"语义对它不成立,必须清掉重来
+        for p in (part, part + ".shards.json"):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+    else:
         os.replace(part, out)
+        label = "分片×多通道"
         journal("dl", "%s | %s | %.2fMB/s"
                 % (name, label, got / max(secs, 1e-6) / 1e6))
-        print("完成 → %s (%s, 平均 %.2f MB/s)"
-              % (out, human(got), got / max(secs, 1e-6) / 1e6))
+        print("完成 → %s (%s, 本次 %.2f MB/s)"
+              % (out, human(os.path.getsize(out)),
+                 got / max(secs, 1e-6) / 1e6))
         return
+
+    rounds = 1 if (args.direct or args.mirror) else 2   # 自动池失败可强制重验一轮
+    for round_i in range(rounds):
+        for m in chain:
+            if m and m.startswith("PROXY:"):
+                real_url, prox, label = url, m[6:], "本地代理 %s" % m[6:]
+            else:
+                real_url, prox = (m + url) if m else url, None
+                label = "直连" if m is None else urlparse(m).netloc
+            print("==> 尝试 %s" % label)
+            try:
+                got, secs = download_once(real_url, part,
+                                          resume=os.path.exists(part),
+                                          min_speed=args.min_speed, proxy=prox)
+            except KeyboardInterrupt:
+                print("\n已中断,断点保存在 %s,重跑同一命令可续传" % part)
+                return
+            except Exception as e:
+                print("    失败:%s" % e)
+                continue
+            os.replace(part, out)
+            journal("dl", "%s | %s | %.2fMB/s"
+                    % (name, label, got / max(secs, 1e-6) / 1e6))
+            print("完成 → %s (%s, 平均 %.2f MB/s)"
+                  % (out, human(got), got / max(secs, 1e-6) / 1e6))
+            return
+        if round_i + 1 < rounds:
+            print("==> 全部通道失败,强制重验镜像池后再试一轮")
+            chain = mirror_pool(force=True) + [None]
+            if proxy:
+                chain.append("PROXY:" + proxy)
     journal("dl-fail", url)
     sys.exit("全部通道均失败;可稍后重试,或:① ghspeed mirrors 看镜像健康状况  "
              "② ghspeed proxy detect 找本地代理后 GHSPEED_PROXY=... ghspeed dl ...")
