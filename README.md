@@ -147,7 +147,9 @@ ghspeed 按阶梯逐级兜底,`ghspeed status` 一次看清各级状态:
    候选 IP 除 DoH/内置网段外,还会拉**社区 hosts 源**(GitHub520/ineo6,6h 缓存),
    但一律过 TLS+SNI 真实验证才可能被钉上
 2. **动态镜像池** —— 下载/clone 的备胎。发布站(ghproxy.link)+ 已知家族域名做候选,
-   拿真实 release 资产逐个验证,24h 缓存;发布站够不着时沿用旧池不洗空
+   拿真实 release 资产逐个验证,**下单顺序按实测延迟排(动态序,快→慢)**;
+   静态默认序只是候选来源、不代表最快,免检入池不存在(静态也要过验证)。
+   24h 缓存;发布站够不着时沿用旧池不洗空
 3. **ssh443** —— git 的活路。`ssh.github.com:443` 是 GitHub 官方备用 SSH 口,
    **不走 TLS、没有 SNI 可拦**,HTTPS 被整段丢弃的坏窗口里它通常还活着
    (先 `ghspeed ssh443 test` 验一把,通就 `on`,写入 `~/.ssh/config` 标记块,`off` 还原)

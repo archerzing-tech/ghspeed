@@ -80,9 +80,9 @@ REFRESH_INTERVAL = 1800  # 秒
 try:
     with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "VERSION")) as _f:
-        __version__ = _f.read().strip() or "0.4.3"
+        __version__ = _f.read().strip() or "0.4.4"
 except Exception:
-    __version__ = "0.4.3"
+    __version__ = "0.4.4"
 
 # 只处理这些 GitHub 域名,一个都不多
 DOMAINS = [
@@ -385,8 +385,20 @@ def validate_mirror(prefix, timeout=8):
         return None
 
 
+def _pool_urls(entries):
+    """dyn["mirrors"] 兼容两代形态:旧 ["url"] / 新 [[url, rtt]](延迟序)→ 出 url 列表"""
+    out = []
+    for e in entries:
+        u = e[0] if isinstance(e, (list, tuple)) else e
+        if u not in out:
+            out.append(u)
+    return out
+
+
 def mirror_pool(force=False):
-    """静态种子 + 发布站动态镜像(逐个验证过);24h 缓存,拉不到源沿用旧池"""
+    """镜像下单链:静态种子 + 发布站动态候选,**一律真验证、按实测延迟排序**。
+    静态默认序只是候选来源,不代表最快——顺序以动态实测为准(快→慢)。
+    24h 缓存(连延迟一起存);源够不着/坏窗口全验不过时沿用旧池,永不洗空。"""
     env = os.environ.get("GHSPEED_MIRRORS")
     if env:   # 用户显式指定时完全尊重用户,不掺动态
         return [m.strip().rstrip("/") + "/" for m in env.split(",") if m.strip()]
@@ -394,44 +406,38 @@ def mirror_pool(force=False):
     cached = dyn.get("mirrors") or []
     now = time.time()
     if not force and cached and now - dyn.get("mirrors_ts", 0) < MIRROR_FEED_TTL:
-        return list(MIRRORS) + [m for m in cached if m not in MIRRORS]
+        return _pool_urls(cached)   # 缓存里存的就是延迟序
 
-    pool = list(MIRRORS)
-    seen, cands, fetched = set(pool), [], False
-    for c in MIRROR_EXTRA_CANDIDATES:
+    cands, seen = [], set()
+    for c in list(MIRRORS) + list(MIRROR_EXTRA_CANDIDATES):   # 静态不再免检
         if c not in seen:
             seen.add(c)
             cands.append(c)
     for src in _env_csv("GHSPEED_MIRROR_FEEDS", MIRROR_FEED_SOURCES):
         try:
             html = fetch_url(src, timeout=8)
-            fetched = True
         except Exception:
-            continue
+            continue   # 发布站死了不打紧:静态+种子候选照常验证
         for host in re.findall(r"https?://([a-zA-Z0-9.-]+)", html):
             host = host.lower().rstrip(".")
             if (re.search(r"gh|proxy|mirror", host)
                     and not host.endswith(("github.com", "github.io",
                                            "githubusercontent.com",
-                                           "githubassets.com", "ghproxy.link"))
-                    and host not in seen):
-                seen.add(host)
-                cands.append("https://%s/" % host)
-    if fetched:
-        alive = []
-        with cf.ThreadPoolExecutor(10) as ex:
-            for p, rtt in ex.map(lambda p: (p, validate_mirror(p)), cands[:24]):
-                if rtt is not None:
-                    alive.append(p)
-        if alive:
-            dyn["mirrors"], dyn["mirrors_ts"] = alive, now
-            dyn_save(dyn)
-            pool += [m for m in alive if m not in pool]
-        elif cached:   # 全验不过(疑似坏窗口):沿用旧池,别把空结果缓存 24h
-            pool += [m for m in cached if m not in pool]
-    elif cached:   # 发布站也够不着:沿用旧池,别把池子洗空
-        pool += [m for m in cached if m not in pool]
-    return pool
+                                           "githubassets.com", "ghproxy.link"))):
+                u = "https://%s/" % host
+                if u not in seen:
+                    seen.add(u)
+                    cands.append(u)
+    alive = []
+    with cf.ThreadPoolExecutor(10) as ex:
+        for p, rtt in ex.map(lambda p: (p, validate_mirror(p)), cands[:28]):
+            if rtt is not None:
+                alive.append((p, rtt))
+    alive.sort(key=lambda x: x[1])   # ★ 动态排序:实测延迟快的排前面
+    if alive:
+        dyn["mirrors"], dyn["mirrors_ts"] = alive, now
+        dyn_save(dyn)
+    return _pool_urls(alive or cached)   # 全验不过=疑似坏窗口,沿用旧池不洗空
 
 
 def ip_feed_candidates(force=False):
@@ -1033,10 +1039,12 @@ MIRROR_TEST_URL = ("https://github.com/jqlang/jq/releases/download/"
 def cmd_mirrors(args):
     print("镜像健康检查(HEAD 真实 release 资产 jq-linux-amd64):")
     pool = mirror_pool()
-    dyn = set(dyn_load().get("mirrors") or []) - set(MIRRORS)
-    print("(池子:静态 %d + 动态 %d,动态来源 %s,均验证过)"
-          % (len(pool) - len(dyn & set(pool)), len(dyn & set(pool)),
+    print("(池子:静态 %d + 动态 %d,动态来源 %s,全部真验证过)"
+          % (len([m for m in pool if m in set(MIRRORS)]),
+             len([m for m in pool if m not in set(MIRRORS)]),
              "、".join(MIRROR_FEED_SOURCES)))
+    print("(下单链按实测延迟排序(动态序);静态默认序 %s 只是候选来源,不代表最快)"
+          % " → ".join(urlparse(m).netloc for m in MIRRORS))
 
     def t(m):
         url = (m + MIRROR_TEST_URL) if m else MIRROR_TEST_URL
@@ -1063,7 +1071,7 @@ def cmd_mirrors(args):
         if m is None:
             name = "直连(吃 hosts 优化)"
         else:
-            name = urlparse(m).netloc + ("·动态" if m in dyn else "")
+            name = urlparse(m).netloc + ("·静态" if m in MIRRORS else "·动态")
         if ms is not None:
             print("  + %-30s %5.0f ms  HTTP %s" % (name, ms * 1000, code))
             if m is not None and code == 200:
