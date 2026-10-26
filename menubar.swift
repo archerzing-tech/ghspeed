@@ -182,13 +182,14 @@ func latestAction() -> String? {
     return "\(ts) \(act) \(detail)".trimmingCharacters(in: .whitespaces)
 }
 
-// 实测 github.com 延迟(HEAD,4 秒超时);返回毫秒,-1 不通
-func measureLatency() -> Int {
-    // 连探两次:偶发丢一发就报"链路波动"太冤枉,失败后隔 1 秒再试
-    for attempt in 0..<2 {
+// 实测 GitHub 延迟:github.com → api → codeload 逐个试(都是钉选域;
+// raw/gist 本网永久 SNI 阻断,不探)。谁通算谁——github.com 单域被掐
+// ≠ 整站不可用,别动不动喊"链路波动"。全都不通才返回 nil
+func measureLatency() -> (ms: Int, via: String)? {
+    for d in ["github.com", "api.github.com", "codeload.github.com"] {
         let sem = DispatchSemaphore(value: 0)
         var ms = -1
-        var req = URLRequest(url: URL(string: "https://github.com")!)
+        var req = URLRequest(url: URL(string: "https://" + d)!)
         req.httpMethod = "HEAD"
         req.timeoutInterval = 4
         let t0 = Date()
@@ -197,10 +198,10 @@ func measureLatency() -> Int {
             sem.signal()
         }.resume()
         _ = sem.wait(timeout: .now() + 5)
-        if ms >= 0 || attempt == 1 { return ms }
-        Thread.sleep(forTimeInterval: 1)
+        if ms >= 0 { return (ms, d) }
+        Thread.sleep(forTimeInterval: 0.5)
     }
-    return -1
+    return nil
 }
 
 // ---------------- 主应用 ----------------
@@ -221,6 +222,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var downloading = false
     var timer: Timer?
     var lastHeal = Date.distantPast   // 坏窗口自动重测的限流
+    var lastAllDown = false           // 上一轮是否整段不通(决定 30s 加密复查)
+    var githubDownStreak = 0          // github.com 连续被掐的轮数(≥2 触发自愈)
     var liveItem: NSMenuItem!
     var recentItem: NSMenuItem!
     var liveCount = 0
@@ -254,9 +257,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         actionItems = [toggleItem, refreshItem, mirrorsItem, downloadItem, autostartItem, dnsItem]
 
         refreshUI()
-        timer = Timer.scheduledTimer(withTimeInterval: 120, repeats: true) { [weak self] _ in
-            self?.refreshUI()
-        }
+        armTimer(120)
         // 活动轮询:谁的连接正吃着钉选 IP + 最近一条自身动作,5 秒一拍
         Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             DispatchQueue.global().async {
@@ -330,24 +331,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
         DispatchQueue.global().async {
-            let ms = measureLatency()
+            let r = measureLatency()
             DispatchQueue.main.async {
-                if ms >= 0 {
-                    self.latencyLine.title = "github.com:\(ms) ms"
+                if let r = r {
+                    if r.via == "github.com" {
+                        self.latencyLine.title = "github.com:\(r.ms) ms"
+                        self.githubDownStreak = 0
+                    } else {
+                        // github.com 被掐但别的域活着:照实说,别吓人
+                        self.latencyLine.title = "github.com 波动中(\(r.via) \(r.ms) ms 可用)"
+                        self.githubDownStreak += 1
+                    }
+                    self.lastAllDown = false
                 } else if hostsOn().on {
-                    // 已开启还不通 = 坏窗口(TLS 整段被丢),不是没加速
+                    // 已开启还整段不通 = 坏窗口(TLS 全被丢),不是没加速
                     self.latencyLine.title = "github.com:链路波动中(通常几分钟内自动恢复)"
-                    self.autoHealIfNeeded()
+                    self.lastAllDown = true
+                    self.githubDownStreak += 1
                 } else {
                     self.latencyLine.title = "github.com:当前直连不通(建议开启加速)"
+                    self.lastAllDown = false
                 }
+                self.autoHealIfNeeded()
+                self.armTimer(self.lastAllDown ? 30 : 120)   // 坏窗口期 30 秒一测,快点走出去
             }
         }
     }
 
-    // 已开启但 github.com 不通 → 免密可用就静默重测钉新 IP(5 分钟最多一次)
+    // 坏窗口期加密复查,平时维持 2 分钟一拍(重排前先拆旧 Timer,防叠加)
+    func armTimer(_ interval: TimeInterval) {
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            self?.refreshUI()
+        }
+    }
+
+    // 整段不通、或 github.com 连续两轮被掐(其余域还活着)→ 免密重测钉新 IP
+    // (2 分钟最多一次;refresh -q 全量重测,当前能过 TLS 握手的候选才会被钉上)
     func autoHealIfNeeded() {
-        guard Date().timeIntervalSince(lastHeal) > 300,
+        guard Date().timeIntervalSince(lastHeal) > 120,
+              lastAllDown || githubDownStreak >= 2,
               FileManager.default.fileExists(atPath: ENGINE_BIN) else { return }
         lastHeal = Date()
         DispatchQueue.global().async { [weak self] in
