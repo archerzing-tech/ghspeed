@@ -121,9 +121,19 @@ func hostsOn() -> (on: Bool, count: Int) {
     return (true, n)
 }
 
-// 系统 DNS 是否已接管(root 引擎的备份落在 /var/root)
+// 系统 DNS 是否已接管——读真实系统态(任一启用服务的 DNS 含 223.5.5.5)。
+// 之前查 /var/root 的备份文件,但 osascript 提权时 HOME 保留为用户家(备份根本不在那),
+// 且 /var/root 用户态读不了 → 状态永远"未接管",再点就撞"已接管过"报错
 func dnsOn() -> Bool {
-    return FileManager.default.fileExists(atPath: "/var/root/.ghspeed/dns_backup.json")
+    let r = runShell(["/usr/sbin/networksetup", "-listallnetworkservices"], timeout: 5)
+    guard r.code == 0 else { return false }
+    for line in r.out.split(separator: "\n").dropFirst() {
+        let svc = line.trimmingCharacters(in: .whitespaces)
+        if svc.isEmpty || svc.hasPrefix("*") { continue }   // * = 已禁用的服务
+        let g = runShell(["/usr/sbin/networksetup", "-getdnsservers", svc], timeout: 5)
+        if g.out.contains("223.5.5.5") { return true }
+    }
+    return false
 }
 
 // ---------------- 活动可视化:连接级实时 + 最近动作 ----------------
@@ -310,7 +320,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.item.button?.title = self.liveCount > 0 ? "🐙⚡" : "🐙"
             }
             self.autostartItem.state = self.autostartInstalled() ? .on : .off
-            self.dnsItem.state = dnsOn() ? .on : .off
+        }
+        DispatchQueue.global().async {          // DNS 态要跑 networksetup,放后台查
+            let dnsIsOn = dnsOn()
+            DispatchQueue.main.async {
+                self.dnsItem.state = dnsIsOn ? .on : .off
+                self.dnsItem.title = dnsIsOn ? "系统 DNS 还原(取消接管)"
+                                             : "系统 DNS 接管(可选)"
+            }
         }
         DispatchQueue.global().async {
             let ms = measureLatency()

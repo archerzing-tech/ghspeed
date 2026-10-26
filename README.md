@@ -100,7 +100,7 @@ sudo ghspeed off                 # 完全还原
 | 镜像检测… | 并发探测各镜像健康度与延迟 |
 | ⬇️ 下载剪贴板中的 GitHub 链接 | 复制链接 → 点一下,图标显示 `⬇️ xx%`,完成后弹通知,文件落在「下载」 |
 | 开机自启 | 用户级 LaunchAgent,无需管理员 |
-| 系统 DNS 接管(可选) | 换成国内不投毒公共 DNS(影响全部网站;原配置自动备份,再点一次原样还原) |
+| 系统 DNS 接管(可选) | 换成国内不投毒公共 DNS(影响全部网站;原配置自动备份)。菜单项按**系统真实状态**在「接管/还原」间切换,还原永远可用(备份丢了也会清扫回自动获取) |
 | 关于 GHSpeed | 显示版本号与项目地址 |
 
 **启动即测**:应用一启动就在后台先跑一轮测速(用户权限,不写 hosts、不弹密码),结果存入种子缓存——之后点「开启加速」或「立即测速刷新」大多直接走种子轮,几秒完成。若当时已开启加速且配好了免密授权,启动测完还会自动把更优 IP 应用上,无需任何点击;检测到链路波动(已开启但不通)也会自动重测自愈。
@@ -121,7 +121,7 @@ ghspeed dl <url> [-o 路径] [--direct] [--min-speed KB/s] [--proxy http://127.0
 ghspeed git on | off      git clone 走镜像(push 前记得 off)
 ghspeed ssh443 test|on|off   git 改走 ssh.github.com:443 官方备用 SSH 口
 ghspeed proxy             探测本机代理端口并给出接管命令(只检测,不接管)
-ghspeed dns on|off|show   系统 DNS 换干净公共 DNS(opt-in;off 原样还原)
+ghspeed dns on|off|show   系统 DNS 换干净公共 DNS(opt-in;off 永远可取消,没备份也能清扫回自动获取)
 ghspeed live             看当前谁正连着钉选 IP(请求吃到加速的实时视图)
 ghspeed activity         回放 ghspeed 自身动作日志(下载通道/刷新/开关)
 ghspeed --version         版本号
@@ -157,8 +157,10 @@ ghspeed 按阶梯逐级兜底,`ghspeed status` 一次看清各级状态:
 
 另有一个独立的可选开关:`ghspeed dns on` 把系统 DNS 换成国内不投毒的公共 DNS
 (阿里 223.5.5.5 / 腾讯 119.29.29.29), hosts 没钉到的域(如 `ssh.github.com`)
-和其他应用都能拿到真实解析;原配置备份在 `~/.ghspeed/dns_backup.json`,
-`ghspeed dns off` 原样还原(原来 DHCP 的还原成 DHCP)。影响全部网站,所以默认不动。
+和其他应用都能拿到真实解析;原配置备份在 `~/.ghspeed/dns_backup.json`。
+接管状态一律读**系统真实 DNS**(不赌备份文件在哪个家),UI 按钮按真实状态切换;
+`ghspeed dns off` 永远可取消——有备份按备份还原,备份丢了就把我们的 DNS 清扫回自动获取,
+重复 `dns on` 也不再报错(幂等)。影响全部网站,所以默认不动。
 
 自定义镜像列表:
 

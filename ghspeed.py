@@ -80,9 +80,9 @@ REFRESH_INTERVAL = 1800  # 秒
 try:
     with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "VERSION")) as _f:
-        __version__ = _f.read().strip() or "0.4.1"
+        __version__ = _f.read().strip() or "0.4.2"
 except Exception:
-    __version__ = "0.4.1"
+    __version__ = "0.4.2"
 
 # 只处理这些 GitHub 域名,一个都不多
 DOMAINS = [
@@ -1008,8 +1008,8 @@ def cmd_status(args):
     print("  ④ 本地代理       %s" % (",".join(found) + "(ghspeed proxy detect 看接法)"
           if found else "未发现常见端口"))
     if not IS_LINUX:
-        print("  ⑤ 系统 DNS       %s" % ("已接管(dns off 还原)"
-              if os.path.exists(dns_backup_file()) else "未接管(可选:ghspeed dns on)"))
+        print("  ⑤ 系统 DNS       %s" % ("已接管(dns off 可取消)"
+              if dns_is_on() else "未接管(可选:ghspeed dns on)"))
     conns = live_connections()
     if conns:
         total = sum(n for _, n in conns)
@@ -1361,39 +1361,117 @@ def cmd_dns(args):
         sys.exit("Linux 的 DNS 管理各家发行版差异大,请手工改 /etc/resolv.conf 或 "
                  "systemd-resolved;建议就填:%s" % " ".join(DNS_CLEAN))
     if args.action == "show":
+        print("接管状态:%s" % ("已接管(dns off 可取消)" if dns_is_on() else "未接管"))
         for svc, cur in _dns_current():
             print("  %-24s %s" % (svc, " ".join(cur) if cur else "(自动获取/DHCP)"))
-        print("\n备份文件:%s%s" % (dns_backup_file(),
-              "(存在 → dns off 可还原)" if os.path.exists(dns_backup_file())
-              else "(不存在,说明没接管过)"))
+        print("\n备份文件:%s" % dns_backup_file(), end="")
+        if os.path.exists(dns_backup_file()):
+            print("(存在,dns off 会按它还原)")
+        elif IS_MAC:
+            print("(本身份下没有;不管备份落在哪,dns off 都能取消接管)")
+        else:
+            print("(不存在,说明没接管过)")
         return
     need_root()   # 改系统 DNS 要管理员;show 不用
 
     items = _dns_current()
     if args.action == "on":
-        if os.path.exists(dns_backup_file()):
-            sys.exit("已接管过(备份在 %s);重复接管会覆盖备份,先 dns off 再说" % dns_backup_file())
-        backup = [{"svc": s, "dns": cur} for s, cur in items]
+        # 幂等:已接管的服务保留旧备份里的原值,其余现取快照——重复接管不再报错
+        taken = {s for s, cur in items if cur and set(DNS_CLEAN) & set(cur)}
+        _, old = _dns_load_backup()
+        backup = [{"svc": s, "dns": (old.get(s) if s in taken else cur)}
+                  for s, cur in items]
         os.makedirs(os.path.dirname(dns_backup_file()), exist_ok=True)
         with open(dns_backup_file(), "w") as f:
             json.dump({"time": time.time(), "platform": _platform.system(),
                        "items": backup}, f, ensure_ascii=False, indent=1)
+        for p in _dns_backup_paths():   # 备份统一收敛到当前身份这一份
+            if p != dns_backup_file():
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+        ok_n, fail = 0, []
         for s, _ in items:
-            _dns_apply(s, DNS_CLEAN)
-        journal("dns-on", " ".join(DNS_CLEAN))
-        print("已把系统 DNS 换成 %s(原配置备份在 %s)" % (" ".join(DNS_CLEAN), dns_backup_file()))
-        print("影响全部网站(不只 GitHub);还原:ghspeed dns off")
+            good, err = _dns_apply(s, DNS_CLEAN)
+            if good:
+                ok_n += 1
+            else:
+                fail.append("%s:%s" % (s, err))
+        journal("dns-on", "%d/%d" % (ok_n, len(items)))
+        if ok_n == 0:
+            try:
+                os.remove(dns_backup_file())
+            except Exception:
+                pass
+            sys.exit("一个服务都没改成;" + ";".join(fail or ["未知原因"]))
+        print("%s已把系统 DNS 换成 %s(%d/%d 个服务;原配置备份在 %s)" % (
+            "(已在接管中,本次为幂等重刷) " if taken and taken == {s for s, _ in items}
+            else "", " ".join(DNS_CLEAN), ok_n, len(items), dns_backup_file()))
+        if fail:
+            print("没改成的服务:%s" % ";".join(fail))
+        print("影响全部网站(不只 GitHub);随时取消:ghspeed dns off")
     else:
+        # 取消接管:有备份按备份还原;没备份(或没覆盖到)就把我们的 DNS 清扫回自动获取
+        # —— 永远可取消,不存在"备份丢了就没法还原"的死路
+        _, old = _dns_load_backup()
+        items = _dns_current()
+        n_rest, n_swept, fail = 0, 0, []
+        for s, cur in items:
+            still_ours = bool(cur and set(DNS_CLEAN) & set(cur))
+            if s in old:
+                good, err = _dns_apply(s, old[s])
+            elif still_ours:
+                good, err = _dns_apply(s, None)   # 没有原值 → 回自动获取
+            else:
+                continue
+            if good:
+                n_rest, n_swept = (n_rest + 1, n_swept) if s in old else (n_rest, n_swept + 1)
+            else:
+                fail.append("%s:%s" % (s, err))
+        if not old and not n_rest and not n_swept:
+            print("本来就未接管(当前 DNS 里没有 %s),无需还原" % "/".join(DNS_CLEAN))
+            return
+        for p in _dns_backup_paths():
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+        journal("dns-off", "%d还原/%d清扫" % (n_rest, n_swept))
+        print("已取消接管:还原 %d 个 + 清扫 %d 个 → 自动获取" % (n_rest, n_swept))
+        if fail:
+            print("没动成的:%s(可再跑一次 dns off)" % ";".join(fail))
+
+
+def _dns_backup_paths():
+    """备份可能落的位置:当前身份的家 + (mac) 控制台用户家 + /var/root。
+    osascript 提权不改 HOME、sudo 反之——备份在谁家不该被赌,全都找一遍"""
+    out = [dns_backup_file()]
+    if IS_MAC:
+        extra = ["/var/root/.ghspeed/dns_backup.json"]
         try:
-            with open(dns_backup_file()) as f:
-                backup = json.load(f).get("items", [])
+            import pwd
+            home = pwd.getpwuid(os.stat("/dev/console").st_uid).pw_dir
+            extra.insert(0, os.path.join(home, ".ghspeed", "dns_backup.json"))
         except Exception:
-            sys.exit("没有备份文件(从没 dns on 过),不知道该还原成什么;拒绝瞎猜")
-        for item in backup:
-            _dns_apply(item["svc"], item["dns"])
-        os.remove(dns_backup_file())
-        journal("dns-off")
-        print("已按备份还原系统 DNS")
+            pass
+        for p in extra:
+            if p not in out:
+                out.append(p)
+    return out
+
+
+def _dns_load_backup():
+    """第一个可读的备份 → (路径, {服务: 原 DNS 或 None});找不到 → (None, {})"""
+    for p in _dns_backup_paths():
+        try:
+            with open(p) as f:
+                items = json.load(f).get("items", [])
+            if items:
+                return p, {it["svc"]: it["dns"] for it in items}
+        except Exception:
+            continue
+    return None, {}
 
 
 def _dns_current():
@@ -1427,15 +1505,33 @@ def _dns_current():
 
 
 def _dns_apply(svc, servers):
+    """写 DNS(不回读校验);返回 (是否成功, 错误摘要)——失败别再无声吞掉"""
     if IS_MAC:
         cmd = ["networksetup", "-setdnsservers", svc] + (servers or ["Empty"])
-        subprocess.run(cmd, capture_output=True, text=True)
-    elif IS_WIN:
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            return False, ((r.stderr or r.stdout or "").strip()
+                           or "rc=%d" % r.returncode)[:80]
+        return True, ""
+    if IS_WIN:
         ps = ("Set-DnsClientServerAddress -InterfaceAlias '%s' " % svc.replace("'", "''")
               + ("-ServerAddresses (%s)" % ",".join("'%s'" % d for d in servers)
                  if servers else "-ResetServerAddresses"))
-        subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                       capture_output=True, text=True)
+        r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            return False, ((r.stderr or "").strip() or "rc=%d" % r.returncode)[:80]
+        return True, ""
+    return False, "unsupported platform"
+
+
+def dns_is_on():
+    """真实接管状态:任一服务/适配器的 DNS 含我们的服务器。
+    读系统态而非备份文件——备份可能落在 root 家或用户家,文件在哪不该决定 UI 状态"""
+    for _s, cur in _dns_current():
+        if cur and set(DNS_CLEAN) & set(cur):
+            return True
+    return False
 
 
 def cmd_live(args):

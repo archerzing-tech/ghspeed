@@ -95,9 +95,16 @@ class App:
 
     def _latency_worker(self):
         ms = self._measure()
-        self.root.after(0, lambda: self.latency.config(
-            text=("github.com:%d ms" % ms) if ms >= 0
-            else "github.com:当前直连不通(建议开启加速)"))
+        try:
+            dns_real = eng.dns_is_on()   # 真实系统态;备份文件落在谁家不该决定按钮
+        except Exception:
+            dns_real = self.dns_on()
+        self.root.after(0, lambda: self._lat_done(ms, dns_real))
+
+    def _lat_done(self, ms, dns_real):
+        self.latency.config(text=("github.com:%d ms" % ms) if ms >= 0
+                            else "github.com:当前直连不通(建议开启加速)")
+        self.dns_btn.config(text="DNS 还原" if dns_real else "DNS 接管")
 
     @staticmethod
     def _measure():
