@@ -64,6 +64,15 @@ def shot():
     root.destroy()
 
 
-root.after(18000, shot)  # 等镜像检测出结果
+def wait_idle(tries=40):
+    """等镜像检测跑完再截:状态行还在 ⏳ 就每 2 秒再看一次,最多约 80 秒。"""
+    txt = app.status.cget("text")
+    if "⏳" in txt and tries > 0:
+        root.after(2000, lambda: wait_idle(tries - 1))
+    else:
+        shot()
+
+
+root.after(18000, wait_idle)  # 等镜像检测出结果
 root.mainloop()
 print("saved:", out)  # CI 控制台是 cp1252,别打中文
