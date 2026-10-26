@@ -236,6 +236,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var downloadItem: NSMenuItem!
     var autostartItem: NSMenuItem!
     var dnsItem: NSMenuItem!
+    var sniItem: NSMenuItem!
     var actionItems: [NSMenuItem] = []
     var busy = false
     var downloading = false
@@ -274,9 +275,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
         autostartItem = addItem("开机自启", #selector(toggleAutostart))
         dnsItem = addItem("系统 DNS 接管(可选)", #selector(toggleDNS))
+        sniItem = addItem("浏览器 SNI 分片(可选)", #selector(toggleSNI))
         addItem("关于 GHSpeed", #selector(about))
         addItem("退出", #selector(quit))
-        actionItems = [toggleItem, refreshItem, mirrorsItem, downloadItem, autostartItem, dnsItem]
+        actionItems = [toggleItem, refreshItem, mirrorsItem, downloadItem, autostartItem, dnsItem, sniItem]
 
         refreshUI()
         armTimer(120)
@@ -306,6 +308,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // 不写 hosts、绝不弹密码)。之后点开启/刷新大多走种子轮,几秒收工;
         // 若已开启且配了免密授权,顺手静默应用一轮,没配就到此为止。
         DispatchQueue.global().async { [weak self] in
+            _ = runShell(engineUserCmd(["sni", "heal"]), timeout: 120)   // 启动自愈:孤儿 PAC 清扫 / relay 复活
             _ = runShell(engineUserCmd(["probe"]), timeout: 300)
             DispatchQueue.main.async {
                 self?.refreshUI()
@@ -350,6 +353,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.dnsItem.state = dnsIsOn ? .on : .off
                 self.dnsItem.title = dnsIsOn ? "系统 DNS 还原(取消接管)"
                                              : "系统 DNS 接管(可选)"
+            }
+        }
+        DispatchQueue.global().async {          // SNI 态要查系统 PAC + relay 端口,放后台
+            let sniIsOn = self.sniOn()
+            DispatchQueue.main.async {
+                self.sniItem.state = sniIsOn ? .on : .off
+                self.sniItem.title = sniIsOn ? "浏览器 SNI 还原(取消分片)"
+                                             : "浏览器 SNI 分片(可选)"
             }
         }
         DispatchQueue.global().async {
@@ -607,6 +618,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    // ---- 浏览器 SNI 分片(识别型阻断的本地解法;opt-in,任何关闭都原样还原) ----
+
+    func sniOn() -> Bool {
+        let r = runShell(engineUserCmd(["sni", "state"]), timeout: 15)
+        return r.out.contains("PAC 接管:已开启")
+    }
+
+    @objc func toggleSNI(_ s: Any) {
+        if busy { return }
+        let on = sniOn()
+        setBusy(true)
+        statusLine.title = on ? "⏳ 正在还原 SNI 分片…"
+                              : "⏳ 正在开启 SNI 分片(首次先实测各策略,约半分钟)…"
+        adminEngine(["sni", on ? "off" : "on"]) { ok, out in
+            self.setBusy(false)
+            notify("GitHub 加速", ok
+                ? (on ? "已还原 SNI 分片设置"
+                      : "SNI 分片已开启(仅 GitHub 域走本地 relay,其余直连)✅")
+                : "SNI 操作失败:\(out.suffix(120))")
+            self.refreshUI()
+        }
+    }
+
     @objc func about(_ s: Any) {
         showTextDialog(
             "🐙 GHSpeed v\(APP_VERSION)\n\n"
@@ -617,7 +651,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             title: "关于 GHSpeed")
     }
 
-    @objc func quit(_ s: Any) { NSApp.terminate(nil) }
+    @objc func quit(_ s: Any) {
+        if busy { return }   // 正在执行的动作没落地前不退,防半截状态
+        if sniOn() {         // 生命周期契约:退出即还原(弹一次授权;取消则下次启动自愈兜底)
+            let argv = engineUserCmd(["sni", "off"])
+            _ = adminShell(argv.joined(separator: " "),
+                           prompt: "退出前还原浏览器 SNI 分片设置")
+        }
+        NSApp.terminate(nil)
+    }
 }
 
 // 用户权限就能跑的引擎调用

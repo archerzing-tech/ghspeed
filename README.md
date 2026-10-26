@@ -102,13 +102,14 @@ sudo ghspeed off                 # 完全还原
 | ⬇️ 下载剪贴板中的 GitHub 链接 | 复制链接 → 点一下,图标显示 `⬇️ xx%`,完成后弹通知,文件落在「下载」 |
 | 开机自启 | 用户级 LaunchAgent,无需管理员 |
 | 系统 DNS 接管(可选) | 换成国内不投毒公共 DNS(影响全部网站;原配置自动备份)。菜单项按**系统真实状态**在「接管/还原」间切换,还原永远可用(备份丢了也会清扫回自动获取) |
+| 浏览器 SNI 分片(可选) | 把 TLS ClientHello 拆散绕过 SNI 识别,浏览器直连 GitHub 网页;仅 GitHub 域走本地 relay。退出 App 时自动还原设置 |
 | 关于 GHSpeed | 显示版本号与项目地址 |
 
 **启动即测**:应用一启动就在后台先跑一轮测速(用户权限,不写 hosts、不弹密码),结果存入种子缓存——之后点「开启加速」或「立即测速刷新」大多直接走种子轮,几秒完成。若当时已开启加速且配好了免密授权,启动测完还会自动把更优 IP 应用上,无需任何点击;检测到链路波动(已开启但不通)也会自动重测自愈。
 
 ### Windows 简易界面
 
-双击 `GHSpeed_gui.pyw` 打开,按钮与 macOS 菜单一一对应:开启/关闭加速、立即测速刷新、镜像检测(结果直接显示在窗口里)、诊断(hosts/镜像池/ssh443/本地代理/DNS 多级通道一次自检)、DNS 接管/还原(点按钮弹 UAC 直接做完)、活动(谁正连着钉选 IP,3 秒自动刷新)、关于(版本号)。开启加速时弹 UAC 授权,提权后自动把开启做完。**操作不弹确认窗,成功结果直接写在窗口状态行**(只有失败才弹窗)。窗口关闭时最小化到系统托盘(装了 `pystray` 时),右键托盘图标退出。
+双击 `GHSpeed_gui.pyw` 打开,按钮与 macOS 菜单一一对应:开启/关闭加速、立即测速刷新、镜像检测(结果直接显示在窗口里)、诊断(hosts/镜像池/ssh443/本地代理/DNS 一次自检)、DNS 接管/还原(点按钮弹 UAC 直接做完)、SNI 分片/还原(免管理员,点按钮即切换)、活动(谁正连着钉选 IP,3 秒自动刷新)、关于(版本号)。开启加速时弹 UAC 授权,提权后自动把开启做完。**操作不弹确认窗,成功结果直接写在窗口状态行**(只有失败才弹窗)。窗口关闭时最小化到系统托盘(装了 `pystray` 时),右键托盘图标退出;**退出时自动还原 SNI 分片设置**。
 
 ### 命令行(三平台通用)
 
@@ -124,6 +125,8 @@ ghspeed git on | off      git clone 走镜像(push 前记得 off)
 ghspeed ssh443 test|on|off   git 改走 ssh.github.com:443 官方备用 SSH 口
 ghspeed proxy             探测本机代理端口并给出接管命令(只检测,不接管)
 ghspeed dns on|off|show   系统 DNS 换干净公共 DNS(opt-in;off 永远可取消,没备份也能清扫回自动获取)
+ghspeed sni test|on|off|state   浏览器 SNI 分片(可选):ClientHello 拆散绕过识别,
+                          仅 GitHub 域走本地 relay;state 看状态,off 原样还原
 ghspeed live             看当前谁正连着钉选 IP(请求吃到加速的实时视图)
 ghspeed activity         回放 ghspeed 自身动作日志(下载通道/刷新/开关)
 ghspeed --version         版本号
@@ -158,6 +161,15 @@ ghspeed 按阶梯逐级兜底,`ghspeed status` 一次看清各级状态:
 4. **本地代理协作** —— 最后一级。`ghspeed proxy` 探测 Clash/V2Ray 常见端口,
    发现了给出**只针对 GitHub** 的 git/下载接管命令;`ghspeed dl --proxy` 或
    `GHSPEED_PROXY=...` 可把它作为下载链的最后一级兜底
+5. **浏览器 SNI 分片**(可选,opt-in)—— 网页侧的 SNI 解法。本地起一个
+   127.0.0.1 relay,把 TLS ClientHello **拆成多个 TCP 段**发出去,部分部署下的
+   SNI 识别逻辑拼不出来就不拦;`sni test` 先实测四种手法(直连对照/切 1 字节/
+   切 SNI 中间/乱序)在你的网络上谁活得久,默认每条连接轮换、不赌单一手法。
+   PAC 只把 GitHub 域分流给 relay(其余网站一律 DIRECT,只碰 GitHub 不破),
+   PAC 恒带 `; DIRECT` 兜底——relay 死了浏览器自动回落直连,不会断网。
+   还原五路收口:显式 off / 退 App / 总 off / DIRECT 兜底 / 启动自愈。
+   诚实的边界:只治"识别型"阻断,治不了拥塞丢包;遇到做完整流重组的节点无效,
+   效果随时段漂移,所以是 opt-in + 一键还原 + 自动重测换策略
 
 另有一个独立的可选开关:`ghspeed dns on` 把系统 DNS 换成国内不投毒的公共 DNS
 (阿里 223.5.5.5 / 腾讯 119.29.29.29), hosts 没钉到的域(如 `ssh.github.com`)
@@ -195,7 +207,7 @@ GHSPEED_MIRRORS="https://your-mirror.example.com/" ghspeed dl <url>
 
 ## 已知限制
 
-- `raw.githubusercontent.com` 与 `gist.github.com` 在部分网络受 SNI 级阻断(与 IP 无关),hosts 钉不住浏览器访问——这两个域的资源走镜像下载(`ghspeed dl` / 菜单下载)即可
+- `raw.githubusercontent.com` 与 `gist.github.com` 在部分网络受 SNI 级阻断(与 IP 无关),hosts 钉不住浏览器访问——这两个域的资源走镜像下载(`ghspeed dl` / 菜单下载);浏览器直连想试的话,`ghspeed sni on` 的分片 relay 有机会绕过识别型阻断(`sni test` 先看你的网络吃不吃这套)
 - 直连链路整段 TLS 被丢时(「坏窗口」,几分钟一变),github.com 可能暂时连不上——这是网络本身在摆动,不是加速失效。refresh 会保留旧钉不回退,macOS 菜单栏检测到波动还会自动重测(免密时);窗口一开就恢复
 - 镜像列表内置 4 个公共 ghproxy 系镜像,失效时用 `GHSPEED_MIRRORS` 自行替换
 

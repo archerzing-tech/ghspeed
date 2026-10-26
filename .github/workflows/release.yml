@@ -157,6 +157,9 @@ jobs:
              逐个验证,下单顺序按实测延迟排)
           1.5 下载分片并行:≥8MB 自动切 8 片、轮转多通道,片级断点续传,失败退回单流链
           2. \`ghspeed ssh443 test\` → 通则 \`on\`:git 走 ssh.github.com:443,不走 TLS 无 SNI 可拦
+          2.5 浏览器 SNI 分片(v0.4.7 新增,可选):\`ghspeed sni test\` 实测后 \`on\`——
+             本地 relay 把 ClientHello 拆散绕过 SNI 识别,仅 GitHub 域分流(PAC 带 DIRECT
+             兜底,relay 挂了自动回落直连);任何关闭(显式 off/退 App/总 off)都原样还原
           3. \`ghspeed proxy\`:发现本机 Clash/V2Ray 端口给出只针对 GitHub 的接管命令;dl 支持 --proxy
           4. \`ghspeed dns on|off\`:可选接管系统 DNS(状态读系统真实 DNS,UI 按真实状态切换;
              off 永远可取消——备份丢了也会清扫回自动获取);\`ghspeed status\` 一屏自检全部通道

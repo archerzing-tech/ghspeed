@@ -28,8 +28,8 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title("GHSpeed — GitHub 加速")
-        root.geometry("660x450")
-        root.minsize(600, 400)
+        root.geometry("760x450")
+        root.minsize(720, 400)
 
         self.status = tk.Label(root, text="读取状态中…", anchor="w",
                                font=("Microsoft YaHei UI", 11, "bold"))
@@ -53,6 +53,9 @@ class App:
         self.dns_btn = tk.Button(bar, text="DNS 接管", width=9,
                                  command=self.toggle_dns)
         self.dns_btn.pack(side="left")
+        self.sni_btn = tk.Button(bar, text="SNI 分片", width=9,
+                                 command=self.toggle_sni)
+        self.sni_btn.pack(side="left", padx=(8, 0))
         self.live_btn = tk.Button(bar, text="活动", width=7,
                                   command=self.run_live)
         self.live_btn.pack(side="left", padx=8)
@@ -69,6 +72,7 @@ class App:
         self.live_mode = False      # 活动视图开着时每 3 秒自动刷新
         self._live_after = None
         self.refresh_ui()
+        threading.Thread(target=self._sni_boot, daemon=True).start()
         if "--elevated-on" in sys.argv:  # UAC 提权重启后自动开启
             self.root.after(300, self.toggle)
         elif "--elevated-dns" in sys.argv:  # UAC 提权重启后自动接管/还原 DNS
@@ -99,9 +103,13 @@ class App:
             dns_real = eng.dns_is_on()   # 真实系统态;备份文件落在谁家不该决定按钮
         except Exception:
             dns_real = self.dns_on()
-        self.root.after(0, lambda: self._lat_done(ms, via, dns_real))
+        try:
+            sni_real = eng.sni_state()["enabled"]
+        except Exception:
+            sni_real = False
+        self.root.after(0, lambda: self._lat_done(ms, via, dns_real, sni_real))
 
-    def _lat_done(self, ms, via, dns_real):
+    def _lat_done(self, ms, via, dns_real, sni_real=False):
         if ms >= 0:   # 与 macOS 菜单栏同一套少喊狼逻辑:单域被掐 ≠ 整站不可用
             self.latency.config(
                 text="github.com:%d ms" % ms if via == "github.com"
@@ -109,6 +117,7 @@ class App:
         else:
             self.latency.config(text="github.com:当前直连不通(建议开启加速)")
         self.dns_btn.config(text="DNS 还原" if dns_real else "DNS 接管")
+        self.sni_btn.config(text="SNI 还原" if sni_real else "SNI 分片")
 
     @staticmethod
     def _measure():
@@ -176,6 +185,10 @@ class App:
     def _do_off(self):
         eng.remove_hosts()
         eng.daemon_remove()
+        try:
+            eng.sni_off(quiet=True)   # 总开关收口:SNI 分片一并还原
+        except Exception:
+            pass
 
     def _do_refresh(self):
         state, dead = eng.find_best(progress=False)
@@ -241,6 +254,58 @@ class App:
                 ok, msg = False, "DNS 操作失败:%s" % e
             except Exception as e:
                 ok, msg = False, "DNS 操作失败:%s" % e
+            self.root.after(0, lambda: self.done(ok, msg))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---------------- SNI 分片(浏览器 GitHub 直连的识别型阻断;opt-in) ----------------
+
+    def _sni_boot(self):
+        """生命周期契约:启动自愈孤儿状态;开着就确保 relay 活着(进程内兜底)"""
+        try:
+            eng.sni_heal(quiet=True)
+            st = eng.sni_state()
+            if st["enabled"] and not st["relay"]:
+                eng.sni_start_inproc()
+        except Exception:
+            pass
+
+    def toggle_sni(self):
+        if self.busy:
+            return
+        try:
+            turning_on = not eng.sni_state()["enabled"]   # 点按钮即切换,不弹确认窗
+        except Exception:
+            turning_on = True
+        self.set_busy(True)
+        self.status.config(
+            text="⏳ 正在%s浏览器 SNI 分片%s…"
+                 % ("开启" if turning_on else "还原",
+                    "(首次先实测各策略,约半分钟)" if turning_on else ""),
+            fg="#b58900")
+
+        def work():
+            try:
+                if turning_on:
+                    cfg = eng.sni_cfg()
+                    if not cfg.get("time") or time.time() - cfg["time"] > 7 * 86400:
+                        old, sys.stdout = sys.stdout, io.StringIO()
+                        try:
+                            eng.cmd_sni_test()
+                        finally:
+                            sys.stdout = old
+                    eng.sni_pac_on()
+                    if not eng._sni_spawn_relay():
+                        eng.sni_start_inproc()
+                    eng.journal("sni-on", eng.sni_strategy())
+                    ok, msg = True, "SNI 分片已开启 ✅(仅 GitHub 域走本地 relay,其余直连)"
+                else:
+                    eng.sni_off()
+                    ok, msg = True, "SNI 分片已还原 ✅"
+            except SystemExit as e:
+                ok, msg = False, "SNI 操作失败:%s" % e
+            except Exception as e:
+                ok, msg = False, "SNI 操作失败:%s" % e
             self.root.after(0, lambda: self.done(ok, msg))
 
         threading.Thread(target=work, daemon=True).start()
@@ -359,6 +424,10 @@ class App:
         self.root.withdraw()   # 直接缩到托盘,不弹提示窗(托盘图标即提示)
 
     def quit_app(self):
+        try:
+            eng.sni_off(quiet=True)   # 退出即还原(生命周期契约:任何关闭都收口)
+        except Exception:
+            pass
         if self.tray is not None:
             try:
                 self.tray.stop()

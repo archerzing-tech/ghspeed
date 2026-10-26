@@ -24,6 +24,7 @@ import os
 import re
 import shutil
 import socket
+import socketserver
 import ssl
 import subprocess
 import sys
@@ -81,9 +82,9 @@ REFRESH_INTERVAL = 1800  # 秒
 try:
     with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "VERSION")) as _f:
-        __version__ = _f.read().strip() or "0.4.6"
+        __version__ = _f.read().strip() or "0.4.7"
 except Exception:
-    __version__ = "0.4.6"
+    __version__ = "0.4.7"
 
 # 只处理这些 GitHub 域名,一个都不多
 DOMAINS = [
@@ -934,8 +935,15 @@ def cmd_off(args):
     need_root()
     removed = remove_hosts()
     daemon_remove()
+    sni_moved = False
+    try:
+        sni_moved = sni_off(quiet=True)
+    except SystemExit:
+        pass
     journal("off", "hosts 已还原" if removed else "本来就未开启")
     print("hosts 中的 ghspeed 条目:%s" % ("已移除" if removed else "本来就没有"))
+    if sni_moved:
+        print("浏览器 SNI 分片(PAC + relay):已一并还原")
     if os.path.exists(BACKUP_FILE):
         print("原始 hosts 备份仍在:%s" % BACKUP_FILE)
     print("定时刷新任务:已卸载")
@@ -1022,6 +1030,13 @@ def cmd_status(args):
     if not IS_LINUX:
         print("  ⑤ 系统 DNS       %s" % ("已接管(dns off 可取消)"
               if dns_is_on() else "未接管(可选:ghspeed dns on)"))
+        if not IS_LINUX:
+            st = sni_state()
+            print("  ⑥ 浏览器 SNI     %s"
+                  % ("已开启(relay %s,策略 %s;sni off 可取消)"
+                     % ("活着" if st["relay"] else "不在跑,已回落 DIRECT 兜底",
+                        st["strategy"])
+                     if st["enabled"] else "未开启(可选:ghspeed sni on)"))
     conns = live_connections()
     if conns:
         total = sum(n for _, n in conns)
@@ -1755,6 +1770,623 @@ def dns_is_on():
     return False
 
 
+# ---------------- 浏览器 SNI 分片(可选,opt-in)----------------
+# 原理:DPI 按明文 SNI 匹配丢包;本地 relay 把 TLS ClientHello 拆成多个 TCP 段
+# 发出去,部分部署下的识别逻辑拼不出 SNI 就不触发 RST。不加密、不翻墙、
+# 不碰证书(浏览器锁标不变),服务器收到的字节流与原文完全一致。
+# 生命周期(还原契约):显式 off / 退 App / 总 off / 崩溃兜底 / 启动自愈,
+# 五条路都收口;PAC 恒带 "…; DIRECT" 兜底,relay 死了浏览器自动回落直连。
+
+SNI_PORT = int(os.environ.get("GHSPEED_SNI_PORT", "18777"))
+
+
+def _sni_home():
+    """文件落点钉在控制台用户家:sudo 重置 HOME 到 /var/root,而 PAC 路径会被
+    写进系统代理配置,浏览器(用户身份)读不到 /var/root 就整体哑掉"""
+    if not IS_WIN:
+        try:
+            import pwd
+            return pwd.getpwuid(os.stat("/dev/console").st_uid).pw_dir
+        except Exception:
+            pass
+    return os.path.expanduser("~")
+
+
+_SNI_DIR = os.path.join(_sni_home(), ".ghspeed")
+SNI_PAC = os.path.join(_SNI_DIR, "ghspeed.pac")
+SNI_CFG = os.path.join(_SNI_DIR, "sni.json")
+SNI_PID = os.path.join(_SNI_DIR, "sni.pid")
+SNI_STRATS = ("direct", "split1", "snisplit", "disorder")
+
+
+def sni_pac_text():
+    doms = ", ".join('"%s"' % d for d in DOMAINS)
+    return (
+        "// GHSpeed 浏览器 SNI 分片:仅下列 GitHub 域走本地分片 relay,其余一律 DIRECT\n"
+        "function FindProxyForURL(url, host) {\n"
+        "  host = host.toLowerCase();\n"
+        "  var d = [" + doms + "];\n"
+        "  for (var i = 0; i < d.length; i++) {\n"
+        "    var s = \".\" + d[i];\n"
+        "    if (host === d[i] || host.substring(host.length - s.length) === s)\n"
+        "      return \"PROXY 127.0.0.1:%d; DIRECT\";\n"
+        "  }\n"
+        "  return \"DIRECT\";\n"
+        "}\n" % SNI_PORT)
+
+
+def sni_pac_url():
+    return "file://" + SNI_PAC.replace(" ", "%20")
+
+
+def sni_pac_ours(url):
+    return bool(url) and url.rstrip("/").endswith("ghspeed.pac")
+
+
+def sni_cfg():
+    try:
+        with open(SNI_CFG) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def sni_strategy():
+    return sni_cfg().get("strategy", "rotate")
+
+
+_ROT_LOCK = threading.Lock()
+_ROT_SEQ = [0]
+
+
+def _conn_strategy():
+    """每条连接轮换分片手法:不赌单一策略,DPI 哪种不防就走哪种;
+    被掐的那条浏览器会自动重试,下一条就换了手法"""
+    s = os.environ.get("GHSPEED_SNI_STRAT") or sni_strategy()
+    if s != "rotate":
+        return s
+    with _ROT_LOCK:
+        i = _ROT_SEQ[0]
+        _ROT_SEQ[0] = (i + 1) % 3
+    return ("split1", "snisplit", "disorder")[i]
+
+
+def _frag_send(sock, data, strat):
+    """首飞字节按策略拆发;TCP 重组后与原文一致,只有中间的 DPI 看不出来"""
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
+    if strat == "split1" and len(data) > 1:
+        sock.sendall(data[:1])
+        time.sleep(0.005)
+        sock.sendall(data[1:])
+    elif strat == "snisplit" and len(data) > 4:
+        pos = data.find(b".com")            # 我们管理的域全以 .com 结尾
+        j = min((pos + 4 if pos >= 0 else len(data) // 2), len(data) - 1)
+        sock.sendall(data[:j])
+        time.sleep(0.005)
+        sock.sendall(data[j:])
+    elif strat == "disorder" and len(data) > 2:
+        mid = max(1, len(data) // 2)
+        sock.sendall(data[mid:])            # 先发后半段
+        time.sleep(0.03)
+        sock.sendall(data[:mid])            # 再发前半段,收端按序重组
+    else:
+        sock.sendall(data)
+
+
+def sni_tls_probe(strat, host="github.com", timeout=8):
+    """按某策略完成一次真实 TLS 握手(验证书+主机名),成功返回耗时 ms。
+    用 wrap_bio 拿到 ClientHello 明文,对上游 socket 手工分片发送"""
+    ctx = ssl.create_default_context()
+    c2s, s2c = ssl.MemoryBIO(), ssl.MemoryBIO()
+    client = ctx.wrap_bio(c2s, s2c, server_hostname=host)
+    t0 = time.perf_counter()
+    with socket.create_connection((host, 443), timeout=timeout) as up:
+        up.settimeout(timeout)
+        try:
+            client.do_handshake()
+        except ssl.SSLWantReadError:
+            pass
+        hello = c2s.read()
+        if hello:
+            _frag_send(up, hello, strat)
+        while True:
+            out = c2s.read()
+            if out:
+                up.sendall(out)
+            try:
+                client.do_handshake()
+                break
+            except ssl.SSLWantReadError:
+                d = up.recv(16384)
+                if not d:
+                    raise ConnectionError("上游提前断开")
+                s2c.write(d)
+            except ssl.SSLWantWriteError:
+                pass
+    return (time.perf_counter() - t0) * 1000
+
+
+def cmd_sni_test(n=None):
+    n = n or int(os.environ.get("GHSPEED_SNI_TEST_N", "6"))
+    print("对 github.com:443 逐策略做 %d 次真实 TLS 握手(验证书):\n" % n)
+    rows = {}
+    for strat in SNI_STRATS:
+        ok, ms = 0, []
+        for _ in range(n):
+            try:
+                ms.append(sni_tls_probe(strat))
+                ok += 1
+            except Exception:
+                pass
+            time.sleep(0.2)
+        avg = sum(ms) / len(ms) if ms else 0.0
+        rows[strat] = (ok, round(avg))
+        print("  %-9s %d/%d 成功   平均 %4.0f ms" % (strat, ok, n, avg))
+        time.sleep(0.3)
+    ranked = sorted(SNI_STRATS, key=lambda s: (-rows[s][0], rows[s][1] or 9e9))
+    best_frag = max(rows[s][0] for s in SNI_STRATS[1:])
+    if rows["direct"][0] > best_frag:
+        pick = "direct"      # 分片反而挨打(中间盒讨厌拆开的握手)→ 老实直连
+    else:
+        pick = "rotate"      # 平手/分片更优 → 每连接轮换,不赌单一手法
+    os.makedirs(os.path.dirname(SNI_CFG), exist_ok=True)
+    with open(SNI_CFG, "w") as f:
+        json.dump({"strategy": pick, "time": time.time(),
+                   "results": rows}, f, ensure_ascii=False, indent=1)
+    journal("sni-test", "%s %d/%d" % (pick, rows[ranked[0]][0], n))
+    print("\n采用策略:%s(已存 %s;7 天后 on 会自动重测换策略)" % (pick, SNI_CFG))
+    if pick == "rotate":
+        print("(rotate = relay 给每条连接轮换 split1/snisplit/disorder,"
+              "被掐的那条浏览器自动重试,下一条就换了手法)")
+    if rows["direct"][0] == n:
+        print("(直连此刻全通:现在没有识别型拦截;开着只在未来坏窗口里起作用)")
+    return pick
+
+
+# ---- relay:只服务 CONNECT 到我们域名列表的请求,别的域一律 403(只碰 GitHub)----
+
+class _SniServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+def _sni_pump(a, b):
+    try:
+        while True:
+            d = a.recv(65536)
+            if not d:
+                break
+            b.sendall(d)
+    except OSError:
+        pass
+    try:
+        b.shutdown(socket.SHUT_WR)
+    except OSError:
+        pass
+
+
+class _SniHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        try:
+            self._relay()
+        except OSError:
+            pass
+
+    def _relay(self):
+        req = b""
+        while b"\r\n\r\n" not in req and len(req) < 16384:
+            d = self.request.recv(4096)
+            if not d:
+                return
+            req += d
+        head, _, rest = req.partition(b"\r\n\r\n")
+        parts = head.split(b"\r\n", 1)[0].decode("latin1", "replace").split()
+        if len(parts) < 2 or parts[0].upper() != "CONNECT":
+            self.request.sendall(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+            return
+        hp = parts[1]
+        host = hp.rsplit(":", 1)[0].strip("[]").lower()
+        port = hp.rsplit(":", 1)[1] if ":" in hp else "443"
+        if not any(host == d or host.endswith("." + d) for d in DOMAINS):
+            self.request.sendall(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+            return
+        try:
+            up = socket.create_connection((host, int(port)), timeout=15)
+        except OSError:
+            try:
+                self.request.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+            except OSError:
+                pass
+            return
+        try:
+            up.settimeout(None)
+            self.request.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            first = self._first_flight(rest)
+            if first:
+                _frag_send(up, first, _conn_strategy())
+            t = threading.Thread(target=_sni_pump, args=(self.request, up), daemon=True)
+            t.start()
+            _sni_pump(up, self.request)
+        finally:
+            try:
+                up.close()
+            except OSError:
+                pass
+
+    def _first_flight(self, rest):
+        """读满第一个 TLS 记录;浏览器可能把 CONNECT 和 ClientHello 捎带同发,rest 就是已读到的部分"""
+        data = rest
+        while len(data) < 5:
+            d = self.request.recv(5 - len(data))
+            if not d:
+                return data
+            data += d
+        if len(data) < 5 or data[0] != 0x16:   # 非 TLS 握手:原样交出去
+            return data
+        rlen = (data[3] << 8) | data[4]
+        while len(data) < 5 + rlen:
+            d = self.request.recv(5 + rlen - len(data))
+            if not d:
+                break
+            data += d
+        return data
+
+
+def sni_serve():
+    os.makedirs(os.path.dirname(SNI_PID), exist_ok=True)
+    try:
+        srv = _SniServer(("127.0.0.1", SNI_PORT), _SniHandler)
+    except OSError as e:
+        sys.exit("relay 启动失败:%s(端口 %d 被占?)" % (e, SNI_PORT))
+    with open(SNI_PID, "w") as f:
+        f.write(str(os.getpid()))
+    try:
+        srv.serve_forever()
+    finally:
+        try:
+            os.remove(SNI_PID)
+        except Exception:
+            pass
+
+
+def sni_start_inproc():
+    """GUI 用:进程内起 relay 线程;端口已被占(独立 relay 在跑)则静默让位"""
+    def run():
+        try:
+            srv = _SniServer(("127.0.0.1", SNI_PORT), _SniHandler)
+            with open(SNI_PID, "w") as f:
+                f.write(str(os.getpid()))
+            srv.serve_forever()
+        except OSError:
+            pass
+    threading.Thread(target=run, daemon=True).start()
+
+
+def _sni_relay_alive():
+    try:
+        socket.create_connection(("127.0.0.1", SNI_PORT), timeout=0.6).close()
+        return True
+    except OSError:
+        return False
+
+
+def _sni_spawn_relay():
+    """起独立 relay 进程(用户级,不依赖 App 活着);已在跑就不动"""
+    if _sni_relay_alive():
+        return True
+    if IS_WIN:
+        if getattr(sys, "frozen", False):
+            cli = os.path.join(os.path.dirname(sys.executable), "ghspeed-cli.exe")
+            if not os.path.exists(cli):
+                return False                      # GUI 的内置 relay 线程兜底
+            cmd = [cli, "sni", "serve"]
+        else:
+            pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+            cmd = [pyw if os.path.exists(pyw) else sys.executable,
+                   os.path.abspath(__file__), "sni", "serve"]
+        kw = {"creationflags": 0x00000008 | 0x08000000}   # DETACHED | NO_WINDOW
+    else:
+        cmd = ["/usr/bin/python3", os.path.abspath(__file__), "sni", "serve"]
+        kw = {"start_new_session": True}
+    try:
+        subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kw)
+    except Exception:
+        return False
+    for _ in range(20):
+        if _sni_relay_alive():
+            return True
+        time.sleep(0.15)
+    return False
+
+
+def _sni_stop_relay():
+    pid = None
+    try:
+        with open(SNI_PID) as f:
+            pid = int(f.read().strip())
+    except Exception:
+        pass
+    if pid and pid != os.getpid():
+        try:
+            if IS_WIN:
+                subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True)
+            else:
+                os.kill(pid, 15)
+        except Exception:
+            pass
+    try:
+        os.remove(SNI_PID)
+    except Exception:
+        pass
+
+
+# ---- 系统 PAC 设置(mac:networksetup 要管理员;win:HKCU 注册表免管理员)----
+
+SNI_BACKUP = os.path.join(_SNI_DIR, "sni_backup.json")
+
+
+def _sni_dir_candidates():
+    """备份可能落在谁家:osascript 提权不改 HOME,sudo 会改——全都找一遍"""
+    out = [os.path.dirname(SNI_BACKUP)]
+    if not IS_WIN:
+        import pwd
+        out.append(os.path.join(os.path.expanduser("~"), ".ghspeed"))
+        try:
+            out.append("/var/root/.ghspeed")
+        except Exception:
+            pass
+    seen, res = set(), []
+    for p in out:
+        if p not in seen:
+            seen.add(p)
+            res.append(p)
+    return res
+
+
+def _sni_backup_write(data):
+    os.makedirs(os.path.dirname(SNI_BACKUP), exist_ok=True)
+    data["time"] = time.time()
+    with open(SNI_BACKUP, "w") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+    for d in _sni_dir_candidates():      # 收敛到当前身份这一份
+        p = os.path.join(d, "sni_backup.json")
+        if p != SNI_BACKUP:
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+
+
+def _sni_backup_read():
+    for d in _sni_dir_candidates():
+        try:
+            with open(os.path.join(d, "sni_backup.json")) as f:
+                return json.load(f)
+        except Exception:
+            continue
+    return None
+
+
+def _sni_backup_clear():
+    for d in _sni_dir_candidates():
+        try:
+            os.remove(os.path.join(d, "sni_backup.json"))
+        except Exception:
+            pass
+
+
+def _mac_pac_get(svc):
+    """networksetup -getautoproxyurl 输出纯文本两行:URL: … / Enabled: Yes|No"""
+    r = subprocess.run(["networksetup", "-getautoproxyurl", svc],
+                       capture_output=True, text=True)
+    out = r.stdout or ""
+    m = re.search(r"^URL:\s*(.*)$", out, re.M)
+    en = re.search(r"^Enabled:\s*Yes\s*$", out, re.M) is not None
+    return en, (m.group(1).strip() if m else "")
+
+
+_WIN_IE = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+
+
+def _win_pac_get():
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _WIN_IE) as k:
+            return winreg.QueryValueEx(k, "AutoConfigURL")[0]
+    except OSError:
+        return None
+
+
+def _win_pac_set(url):
+    import winreg
+    with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, _WIN_IE, 0,
+                            winreg.KEY_SET_VALUE) as k:
+        if url:
+            winreg.SetValueEx(k, "AutoConfigURL", 0, winreg.REG_SZ, url)
+        else:
+            try:
+                winreg.DeleteValue(k, "AutoConfigURL")
+            except OSError:
+                pass
+    try:   # 让 IE/系统代理设置立即生效,不用重开浏览器
+        ctypes.windll.wininet.InternetSetOptionW(None, 39, None, 0)
+        ctypes.windll.wininet.InternetSetOptionW(None, 37, None, 0)
+    except Exception:
+        pass
+
+
+def sni_pac_on():
+    """写系统 PAC。返回失败服务列表(mac)或 True/False(win)"""
+    if IS_WIN:
+        prev = _win_pac_get()
+        _sni_backup_write({"platform": "Windows", "autourl": prev})
+        _win_pac_set(sni_pac_url())
+        return []
+    need_root()
+    items = {}
+    for s in _mac_dns_services():
+        en, u = _mac_pac_get(s)
+        items[s] = {"enabled": en, "url": u}
+    _sni_backup_write({"platform": "Darwin", "services": items})
+    fail = []
+    for s in items:
+        r = subprocess.run(["networksetup", "-setautoproxyurl", s, sni_pac_url()],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            fail.append("%s:%s" % (s, (r.stderr or r.stdout or "失败").strip()))
+    return fail
+
+
+def sni_pac_off():
+    """还原系统 PAC:有备份按备份;没有就把指向我们的清扫掉——永远可取消。
+    返回 (还原数, 清扫数, 失败列表)"""
+    b = _sni_backup_read() or {}
+    n_res = n_sweep = 0
+    fail = []
+    if IS_WIN:
+        cur = _win_pac_get()
+        if sni_pac_ours(cur):
+            _win_pac_set(b.get("autourl"))
+            n_res += 1
+    else:
+        need_root()
+        old = b.get("services") or {}
+        for s in _mac_dns_services():
+            en, cur = _mac_pac_get(s)
+            ours = en and sni_pac_ours(cur)
+            if s in old:
+                o = old[s]
+                if o.get("enabled") and o.get("url"):
+                    r = subprocess.run(["networksetup", "-setautoproxyurl", s, o["url"]],
+                                       capture_output=True, text=True)
+                else:
+                    r = subprocess.run(["networksetup", "-setautoproxystate", s, "off"],
+                                       capture_output=True, text=True)
+            elif ours:
+                r = subprocess.run(["networksetup", "-setautoproxystate", s, "off"],
+                                   capture_output=True, text=True)
+            else:
+                continue
+            if r.returncode == 0:
+                if s in old:
+                    n_res += 1
+                else:
+                    n_sweep += 1
+            else:
+                fail.append("%s:%s" % (s, (r.stderr or r.stdout or "失败").strip()))
+    return n_res, n_sweep, fail
+
+
+def sni_state():
+    url = _win_pac_get() if IS_WIN else None
+    if IS_WIN:
+        enabled = sni_pac_ours(url)
+    elif IS_MAC:
+        enabled = False
+        for s in _mac_dns_services():
+            en, u = _mac_pac_get(s)
+            if en and sni_pac_ours(u):
+                enabled = True
+                break
+    else:
+        enabled = False
+    return {"enabled": enabled, "relay": _sni_relay_alive(),
+            "strategy": sni_strategy()}
+
+
+def sni_off(quiet=False):
+    """完整还原:停 relay → 还原 PAC → 清备份/缓存文件。返回是否动过东西"""
+    if IS_LINUX:
+        return False
+    _sni_stop_relay()
+    try:
+        n_res, n_sweep, fail = sni_pac_off()
+    except SystemExit:
+        if quiet:
+            raise
+        sys.exit("macOS 上取消 PAC 需要管理员:请用界面按钮,或 sudo ghspeed sni off")
+    _sni_backup_clear()
+    try:
+        os.remove(SNI_PAC)
+    except Exception:
+        pass
+    moved = (n_res + n_sweep) > 0
+    journal("sni-off", "%d还原/%d清扫" % (n_res, n_sweep))
+    if not quiet:
+        if not moved:
+            print("本来就未开启(系统里没有指向 ghspeed 的 PAC),无需还原")
+            return False
+        print("已还原:停 relay + PAC 还原 %d 个、清扫 %d 个 → 原样" % (n_res, n_sweep))
+        if fail:
+            print("没动成的:%s(可再跑一次 sni off)" % ";".join(fail))
+    return moved
+
+
+def sni_heal(quiet=False):
+    """启动自愈:开启着但 relay 死了 → 先尝试复活;复活不成 → 清掉孤儿 PAC"""
+    st = sni_state()
+    if not st["enabled"]:
+        return False
+    if st["relay"] or _sni_spawn_relay():
+        return False
+    try:
+        moved = sni_off(quiet=True)
+    except SystemExit:
+        moved = None      # mac 无管理员,清不动 → 交回给调用方(界面)提权重试
+    if moved:
+        journal("sni-heal", "relay 复活失败,孤儿 PAC 已清扫")
+        if not quiet:
+            print("检测到孤儿状态(relay 已死),已自动还原 PAC")
+    return bool(moved)
+
+
+def cmd_sni(args):
+    if IS_LINUX and args.action in ("on", "off"):
+        sys.exit("Linux 桌面各发行版代理设置差异大,sni 暂只支持 macOS/Windows;"
+                 "命令行可手动把浏览器 PAC 指到本地 relay:ghspeed sni state 看用法")
+    if args.action == "test":
+        cmd_sni_test()
+    elif args.action == "serve":
+        sni_serve()
+    elif args.action == "on":
+        cfg = sni_cfg()
+        if not cfg.get("time") or time.time() - cfg["time"] > 7 * 86400:
+            print("还没有可靠的策略数据(或已超 7 天),先实测一轮:\n")
+            cmd_sni_test()
+            print()
+        fail = sni_pac_on()
+        if IS_WIN and fail is not None:
+            pass
+        if not IS_WIN and fail:
+            sys.exit("PAC 没写进去:" + ";".join(fail))
+        _sni_spawn_relay()
+        journal("sni-on", "%s port%d" % (sni_strategy(), SNI_PORT))
+        print("已开启浏览器 SNI 分片:")
+        print("  · PAC:%s(仅 %d 个 GitHub 域走本地 relay,其余 DIRECT)"
+              % (sni_pac_url(), len(DOMAINS)))
+        print("  · relay:127.0.0.1:%d,策略 %s;relay 挂了浏览器自动回落直连,不会断网"
+              % (SNI_PORT, sni_strategy()))
+        if sni_strategy() == "rotate":
+            print("  · rotate = 每条连接轮换分片手法,不赌单一策略(ghspeed sni test 可固定)")
+        print("  · 还原:ghspeed sni off(退出 App 也会自动还原)")
+    elif args.action == "off":
+        sni_off()
+    elif args.action == "heal":
+        sni_heal()
+    else:   # state
+        st = sni_state()
+        print("PAC 接管:%s" % ("已开启(ghspeed sni off 可取消)" if st["enabled"] else "未开启"))
+        print("relay:%s" % ("活着(127.0.0.1:%d)" % SNI_PORT if st["relay"]
+                            else "没在跑(PAC 未开时不需要;开着则浏览器走 DIRECT 兜底)"))
+        print("策略:%s(ghspeed sni test 重测)" % st["strategy"])
+        if st["enabled"] and not st["relay"]:
+            print("⚠ 开着但 relay 不在:浏览器已自动回落直连;ghspeed sni heal 可自愈")
+
+
 def cmd_live(args):
     conns = live_connections()
     if not conns:
@@ -1853,6 +2485,11 @@ def main():
     p = sub.add_parser("dns", help="系统 DNS 换成干净公共 DNS(opt-in,影响全部网站;off 原样还原)")
     p.add_argument("action", choices=["on", "off", "show"])
     p.set_defaults(func=cmd_dns)
+
+    p = sub.add_parser("sni", help="浏览器 SNI 分片(可选):ClientHello 拆散绕过识别,仅 GitHub 域走本地 relay;任何关闭都原样还原")
+    p.add_argument("action", choices=["test", "on", "off", "state", "heal", "serve"],
+                   nargs="?", default="state")
+    p.set_defaults(func=cmd_sni)
 
     if IS_WIN and len(sys.argv) == 1:
         # 双击 ghspeed.exe 时别让黑窗一闪而过:打印帮助后等回车
