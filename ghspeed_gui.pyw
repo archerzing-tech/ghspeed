@@ -388,6 +388,10 @@ class App:
                 fn()
             except KeyboardInterrupt:
                 raise
+            except PermissionError as e:   # hosts 没权限/被安全软件占住:给人话
+                post(False, "%s没有写入 hosts 的权限(或被其他程序占用),"
+                            "请重试;仍失败就以管理员身份运行 [%s]"
+                            % (err_prefix, e))
             except BaseException as e:   # SystemExit 也必须收口,不能永远转圈
                 post(False, "%s:%s" % (err_prefix, e))
             else:

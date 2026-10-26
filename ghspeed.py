@@ -106,9 +106,9 @@ REFRESH_INTERVAL = 1800  # 秒
 try:
     with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "VERSION")) as _f:
-        __version__ = _f.read().strip() or "0.4.10"
+        __version__ = _f.read().strip() or "0.4.11"
 except Exception:
-    __version__ = "0.4.10"
+    __version__ = "0.4.11"
 
 # 只处理这些 GitHub 域名,一个都不多
 DOMAINS = [
@@ -753,6 +753,55 @@ def flush_dns():
         pass
 
 
+def _replace_hosts(text):
+    """把 text 写进 hosts:先临时文件 + 原子替换,替换被拒再退回原地重写。
+
+    Windows 上 hosts 常被安全软件或另一进程的读句柄短暂占住,MoveFileEx
+    会直接抛 WinError 5(拒绝访问)/ 32(占用);这类冲突通常几百毫秒就散,
+    所以先重试几次。仍不行就原地重写(不换文件、不动 ACL),绕开"改名"
+    这一步——很多保护只拦改名/删除,不拦写内容。
+    """
+    tmp = HOSTS_FILE + ".ghspeed.tmp"
+    last = None
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        os.chmod(tmp, 0o644)
+        for delay in (0, 0.2, 0.5, 1.0):
+            if delay:
+                time.sleep(delay)
+            try:
+                os.replace(tmp, HOSTS_FILE)
+                flush_dns()
+                return
+            except PermissionError as e:      # WinError 5 / 32 都归到这里
+                last = e
+                try:                           # 目标带只读属性时先摘掉
+                    os.chmod(HOSTS_FILE, 0o666)
+                except OSError:
+                    pass
+        for delay in (0, 0.2, 0.5, 1.0):
+            if delay:
+                time.sleep(delay)
+            try:
+                os.chmod(HOSTS_FILE, 0o666)
+            except OSError:
+                pass
+            try:
+                with open(HOSTS_FILE, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(text)
+                flush_dns()
+                return
+            except PermissionError as e:
+                last = e
+        raise last
+    finally:
+        try:                                   # 失败也别留垃圾文件
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
 def write_hosts(state):
     """把 ghspeed 的 hosts 块替换/追加进去,其余内容原样保留"""
     text = read_hosts()
@@ -767,12 +816,7 @@ def write_hosts(state):
             shutil.copy2(HOSTS_FILE, BACKUP_FILE)
             os.chmod(BACKUP_FILE, 0o644)
         text += "\n" + block
-    tmp = HOSTS_FILE + ".ghspeed.tmp"
-    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-        f.write(text)
-    os.chmod(tmp, 0o644)
-    os.replace(tmp, HOSTS_FILE)
-    flush_dns()
+    _replace_hosts(text)
 
 
 def remove_hosts():
@@ -780,11 +824,7 @@ def remove_hosts():
     if MARK_S in text:
         text = re.sub(re.escape(MARK_S) + r".*?" + re.escape(MARK_E) + r"\n?",
                       "", text, flags=re.S)
-        tmp = HOSTS_FILE + ".ghspeed.tmp"
-        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-            f.write(text)
-        os.chmod(tmp, 0o644)
-        os.replace(tmp, HOSTS_FILE)
+        _replace_hosts(text)
         flush_dns()
         return True
     return False
