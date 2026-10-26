@@ -80,9 +80,9 @@ REFRESH_INTERVAL = 1800  # 秒
 try:
     with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "VERSION")) as _f:
-        __version__ = _f.read().strip() or "0.4.2"
+        __version__ = _f.read().strip() or "0.4.3"
 except Exception:
-    __version__ = "0.4.2"
+    __version__ = "0.4.3"
 
 # 只处理这些 GitHub 域名,一个都不多
 DOMAINS = [
@@ -133,6 +133,11 @@ MIRROR_EXTRA_CANDIDATES = [
     "https://ghproxy.cc/",
     "https://gh-proxy.net/",
     "https://ghproxy.homeboyc.cn/",
+    # ghproxy.link 社区表里的公共节点(2026-10-26 实测 cors.isteed 活、
+    # gh-proxy.isteed.cc 连不上,以 cors 为准;死活最终以入池验证为准)
+    "https://cdn.gh-proxy.com/",
+    "https://cors.isteed.cc/",
+    "https://gh.ddlc.top/",
 ]
 MIRROR_FEED_TTL = 86400      # 镜像池 24h 重拉
 
