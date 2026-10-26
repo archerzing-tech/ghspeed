@@ -61,6 +61,8 @@ class App:
                  font=("Microsoft YaHei UI", 8)).pack(fill="x", padx=10, pady=(0, 6))
 
         self.busy = False
+        self._job = 0
+        self._exit_after_done = "--elevated-off" in sys.argv
         self.tray = None            # 托盘图标(pystray),main() 里装配
         self.refresh_ui()
         threading.Thread(target=self._sni_boot, daemon=True).start()
@@ -68,6 +70,8 @@ class App:
             self.root.after(300, self.toggle)
         elif "--elevated-dns" in sys.argv:  # UAC 提权重启后自动接管/还原 DNS
             self.root.after(300, self.toggle_dns)
+        elif "--elevated-off" in sys.argv:  # UAC 提权重启后自动关闭
+            self.root.after(300, self.toggle)
 
     # ---------------- 状态 ----------------
 
@@ -134,13 +138,17 @@ class App:
         if self.busy:
             return
         if self.hosts_on():
-            self.run_bg("正在关闭…", self._do_off, "已关闭,已还原 hosts", "关闭失败")
+            if not eng.is_admin():   # 改 hosts 要管理员:提权后再关,别让用户干瞪眼
+                self.elevate("--elevated-off")
+                return
+            self.run_bg("正在关闭…", self._do_off, "已关闭,已还原 hosts", "关闭失败",
+                        timeout=30)
             return
         if not eng.is_admin():
             self.elevate("--elevated-on")
             return
         self.run_bg("正在测速并开启(通常几秒,网络差时约 1 分钟)…",
-                    self._do_on, "已开启 ✅", "开启失败")
+                    self._do_on, "已开启 ✅", "开启失败", timeout=180)
 
     def elevate(self, flag):
         """弹 UAC 重启自己;flag 让提权后的实例接着把事情做完"""
@@ -172,12 +180,22 @@ class App:
         eng.write_hosts(state)
         eng.save_state(state, dead)
         eng.daemon_install()
+        try:
+            eng.journal("on", "%d/%d 域名" % (len(state), len(eng.DOMAINS)))
+        except Exception:
+            pass
 
     def _do_off(self):
-        eng.remove_hosts()
+        eng.remove_hosts()          # 第一步:先把 hosts 还原(用户最关心的)
+        self.root.after(0, lambda: self.status.config(
+            text="⏳ hosts 已还原,正在收起定时刷新/SNI…", fg="#b58900"))
         eng.daemon_remove()
         try:
             eng.sni_off(quiet=True)   # 总开关收口:SNI 分片一并还原
+        except BaseException:
+            pass                     # 收尾失败不影响「hosts 已还原」这个结果
+        try:
+            eng.journal("off", "界面关闭加速")
         except Exception:
             pass
 
@@ -194,7 +212,8 @@ class App:
             return
         ok = ("测速完成,已更新最优 IP ✅" if eng.is_admin() else
               "测速完成(未提权,仅更新缓存;固定 hosts 请点「开启加速」)")
-        self.run_bg("正在测速(通常几秒)…", self._do_refresh, ok, "测速失败")
+        self.run_bg("正在测速(通常几秒)…", self._do_refresh, ok, "测速失败",
+                    timeout=180)
 
     def check_mirrors(self):
         if self.busy:
@@ -231,8 +250,7 @@ class App:
             self.elevate("--elevated-dns")
             return
         self.set_busy(True)
-        self.status.config(text="⏳ 正在%s系统 DNS…" % ("接管" if turning_on else "还原"),
-                           fg="#b58900")
+        self._tick_start("正在%s系统 DNS…" % ("接管" if turning_on else "还原"))
 
         def work():
             try:
@@ -268,11 +286,10 @@ class App:
         except Exception:
             turning_on = True
         self.set_busy(True)
-        self.status.config(
-            text="⏳ 正在%s浏览器 SNI 分片%s…"
-                 % ("开启" if turning_on else "还原",
-                    "(首次先实测各策略,约半分钟)" if turning_on else ""),
-            fg="#b58900")
+        self._tick_start(
+            "正在%s浏览器 SNI 分片%s…"
+            % ("开启" if turning_on else "还原",
+               "(首次先实测各策略,约半分钟)" if turning_on else ""))
 
         def work():
             try:
@@ -338,25 +355,61 @@ class App:
             "关闭窗口=最小化到托盘;右键托盘图标可退出\n"
             "开启加速需管理员授权(修改 hosts + 计划任务)" % eng.__version__)
 
-    def run_bg(self, msg, fn, ok_msg, err_prefix):
-        self.set_busy(True)
+    def _tick_start(self, msg):
+        """状态行每秒报一次耗时:再慢也能看出界面没死;换任务后旧 tick 自动停"""
+        self._job = getattr(self, "_job", 0) + 1
+        job, t0 = self._job, time.time()
+
+        def tick():
+            if job != self._job or not self.busy:
+                return
+            self.status.config(text="⏳ %s(%d 秒)" % (msg, time.time() - t0),
+                               fg="#b58900")
+            self.root.after(1000, tick)
+
         self.status.config(text="⏳ " + msg, fg="#b58900")
+        self.root.after(1000, tick)
+        return job
+
+    def run_bg(self, msg, fn, ok_msg, err_prefix, timeout=None):
+        self.set_busy(True)
+        job = self._tick_start(msg)
+
+        def post(ok, text):
+            if job != self._job:   # 已超时/已换任务:迟到结果不再改写界面
+                return
+            self.root.after(0, lambda: self.done(ok, text))
 
         def work():
             try:
                 fn()
-                self.root.after(0, lambda: self.done(True, ok_msg))
-            except Exception as e:
-                self.root.after(0,
-                                lambda: self.done(False, "%s:%s" % (err_prefix, e)))
+            except KeyboardInterrupt:
+                raise
+            except BaseException as e:   # SystemExit 也必须收口,不能永远转圈
+                post(False, "%s:%s" % (err_prefix, e))
+            else:
+                post(True, ok_msg)
 
         threading.Thread(target=work, daemon=True).start()
+
+        if timeout:
+            def watchdog():
+                if job != self._job or not self.busy:
+                    return
+                self._job += 1          # 让后台迟到的结果失效
+                self.done(False, "%s:%s" % (
+                    err_prefix,
+                    "超时,已停止等待(后台可能仍在收尾,可再点一次)"))
+            self.root.after(int(timeout * 1000), watchdog)
 
     def done(self, ok, msg):
         self.set_busy(False)
         self.refresh_ui()
         if ok:   # 成功不弹窗打扰,结果写在状态行;失败才弹
             self.status.config(text="✅ " + msg, fg="#1a7f37")
+            if self._exit_after_done:   # 提权只是为了关加速:干完就退
+                self._exit_after_done = False
+                self.root.after(700, self.quit_app)
         else:
             messagebox.showerror(APP, msg)
 
@@ -373,9 +426,13 @@ class App:
 
     def quit_app(self):
         try:
-            eng.sni_off(quiet=True)   # 退出即还原(生命周期契约:任何关闭都收口)
+            self.root.withdraw()   # 先把窗口收掉,收尾再慢也看不见卡顿
         except Exception:
             pass
+        try:
+            eng.sni_off(quiet=True)   # 退出即还原(生命周期契约:任何关闭都收口)
+        except BaseException:
+            pass                     # SystemExit/超时都不许挡住退出
         if self.tray is not None:
             try:
                 self.tray.stop()

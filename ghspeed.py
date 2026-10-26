@@ -67,6 +67,30 @@ else:
         STATE_DIR = os.path.expanduser("~/.ghspeed")
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
 
+# Windows 的 GUI 进程没有控制台:不显式给 CREATE_NO_WINDOW,拉起来的每个
+# 控制台子程序(schtasks/powershell/netstat/ipconfig…)都会闪一个黑窗。
+# 这里统一收口,顺带给所有外部命令兜上超时——界面绝不能被一个卡住的子进程吊死。
+_CREATE_NO_WINDOW = 0x08000000
+
+
+def _run(cmd, timeout=20, **kw):
+    """外部命令统一入口:Windows 不弹黑窗;text 模式容错解码(中文系统 GBK)"""
+    if IS_WIN:
+        kw.setdefault("creationflags", _CREATE_NO_WINDOW)
+    if kw.get("text"):
+        kw.setdefault("errors", "replace")
+    if "input" not in kw:
+        kw.setdefault("stdin", subprocess.DEVNULL)   # 绝不让子程序等键盘输入
+    return subprocess.run(cmd, timeout=timeout, **kw)
+
+
+def _popen(cmd, **kw):
+    """后台常驻子进程统一入口:Windows 不弹黑窗"""
+    if IS_WIN:
+        kw.setdefault("creationflags", _CREATE_NO_WINDOW)
+    return subprocess.Popen(cmd, **kw)
+
+
 MARK_S = "# >>> ghspeed start >>>"
 MARK_E = "# <<< ghspeed end <<<"
 
@@ -82,9 +106,9 @@ REFRESH_INTERVAL = 1800  # 秒
 try:
     with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "VERSION")) as _f:
-        __version__ = _f.read().strip() or "0.4.9"
+        __version__ = _f.read().strip() or "0.4.10"
 except Exception:
-    __version__ = "0.4.9"
+    __version__ = "0.4.10"
 
 # 只处理这些 GitHub 域名,一个都不多
 DOMAINS = [
@@ -338,8 +362,8 @@ def live_connections():
     agg = {}
     try:
         if IS_WIN:
-            r = subprocess.run(["netstat", "-ano", "-p", "TCP"],
-                               capture_output=True, text=True, timeout=10)
+            r = _run(["netstat", "-ano", "-p", "TCP"], timeout=10,
+                     capture_output=True, text=True)
             pids = {}
             for line in r.stdout.splitlines():
                 parts = line.split()
@@ -348,8 +372,8 @@ def live_connections():
                     if ip in ips:
                         pids[parts[4]] = pids.get(parts[4], 0) + 1
             if pids:
-                r2 = subprocess.run(["tasklist", "/FO", "CSV", "/NH"],
-                                    capture_output=True, text=True, timeout=10)
+                r2 = _run(["tasklist", "/FO", "CSV", "/NH"], timeout=10,
+                          capture_output=True, text=True)
                 for line in r2.stdout.splitlines():
                     cells = [c.strip().strip('"') for c in line.split('","')]
                     if len(cells) >= 2 and cells[1] in pids:
@@ -357,8 +381,8 @@ def live_connections():
             for pid, n in pids.items():   # 查不到名字的留 PID
                 agg["PID %s" % pid] = agg.get("PID %s" % pid, 0) + n
         else:
-            r = subprocess.run(["lsof", "-i", "TCP", "-n", "-P", "+c", "0"],
-                               capture_output=True, text=True, timeout=10)
+            r = _run(["lsof", "-i", "TCP", "-n", "-P", "+c", "0"], timeout=10,
+                     capture_output=True, text=True)
             for line in r.stdout.splitlines()[1:]:
                 parts = line.split()
                 if len(parts) >= 9 and "->" in parts[8] \
@@ -709,18 +733,24 @@ def current_map_from_hosts():
 
 
 def flush_dns():
-    if IS_WIN:
-        subprocess.run(["ipconfig", "/flushdns"], check=False,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    elif IS_MAC:
-        subprocess.run(["dscacheutil", "-flushcache"], check=False)
-        subprocess.run(["killall", "-HUP", "mDNSResponder"], check=False)
-    else:
-        # systemd-resolved 的两种入口,有哪个用哪个,都没有就无所谓
-        subprocess.run(["resolvectl", "flush-caches"], check=False,
-                       capture_output=True)
-        subprocess.run(["systemd-resolve", "--flush-caches"], check=False,
-                       capture_output=True)
+    # 刷新失败/卡住都不该拖住「关闭加速」:全部有界,失败当没事
+    try:
+        if IS_WIN:
+            _run(["ipconfig", "/flushdns"], timeout=6,
+                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif IS_MAC:
+            _run(["dscacheutil", "-flushcache"], timeout=6,
+                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            _run(["killall", "-HUP", "mDNSResponder"], timeout=6,
+                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            # systemd-resolved 的两种入口,有哪个用哪个,都没有就无所谓
+            _run(["resolvectl", "flush-caches"], timeout=6,
+                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            _run(["systemd-resolve", "--flush-caches"], timeout=6,
+                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
 
 
 def write_hosts(state):
@@ -824,10 +854,13 @@ def daemon_install():
             tr = '\\"%s\\" \\"%s\\" refresh --quiet' % (exe, script)
         else:
             tr = '\\"%s\\" refresh --quiet' % exe
-        subprocess.run(["schtasks", "/Create", "/F", "/RU", "SYSTEM",
-                        "/SC", "MINUTE", "/MO", str(minutes),
-                        "/TN", WIN_TASK, "/TR", tr],
-                       check=False, capture_output=True)
+        try:
+            _run(["schtasks", "/Create", "/F", "/RU", "SYSTEM",
+                  "/SC", "MINUTE", "/MO", str(minutes),
+                  "/TN", WIN_TASK, "/TR", tr],
+                 timeout=20, check=False, capture_output=True)
+        except Exception:
+            pass   # 定时刷新装不上不影响本次 hosts 生效
     elif IS_MAC:
         body = PLIST_TMPL % {"label": PLIST_LABEL, "exe": exe,
                              "script": script, "interval": REFRESH_INTERVAL,
@@ -860,8 +893,11 @@ def daemon_install():
 
 def daemon_remove():
     if IS_WIN:
-        subprocess.run(["schtasks", "/Delete", "/F", "/TN", WIN_TASK],
-                       check=False, capture_output=True)
+        try:
+            _run(["schtasks", "/Delete", "/F", "/TN", WIN_TASK],
+                 timeout=15, check=False, capture_output=True)
+        except Exception:
+            pass   # 计划任务服务卡住也不该拖住关闭
     elif IS_MAC:
         subprocess.run(["launchctl", "bootout", "system/" + PLIST_LABEL],
                        capture_output=True)
@@ -883,8 +919,11 @@ def daemon_remove():
 
 def daemon_installed():
     if IS_WIN:
-        return subprocess.run(["schtasks", "/Query", "/TN", WIN_TASK],
-                              check=False, capture_output=True).returncode == 0
+        try:
+            return _run(["schtasks", "/Query", "/TN", WIN_TASK],
+                        timeout=10, check=False, capture_output=True).returncode == 0
+        except Exception:
+            return False
     if IS_MAC:
         return os.path.exists(PLIST_PATH)
     return os.path.exists(SYSTEMD_TIMER)
@@ -1415,21 +1454,21 @@ def cmd_git(args):
         sys.exit("未找到 git")
     if args.action == "on":
         m = args.mirror or mirror_pool()[0]
-        subprocess.run(["git", "config", "--global", "--replace-all",
-                        "url.%shttps://github.com/.insteadOf" % m,
-                        "https://github.com/"], check=True)
+        _run(["git", "config", "--global", "--replace-all",
+              "url.%shttps://github.com/.insteadOf" % m,
+              "https://github.com/"], timeout=20, check=True)
         print("已开启:git clone https://github.com/... 会自动改走镜像 %s" % m)
         print("注意:push 前请先 sudo/普通运行 ghspeed git off,否则推送会失败")
     else:
-        out = subprocess.run(
+        out = _run(
             ["git", "config", "--global", "--get-regexp", r"^url\..*\.insteadof$"],
-            capture_output=True, text=True).stdout
+            timeout=20, capture_output=True, text=True).stdout
         n = 0
         for line in out.splitlines():
             key, _, val = line.partition(" ")
             if val.strip() == "https://github.com/":
-                subprocess.run(["git", "config", "--global", "--unset-all", key],
-                               check=True)
+                _run(["git", "config", "--global", "--unset-all", key],
+                     timeout=20, check=True)
                 print("已移除:%s" % key)
                 n += 1
         print("已关闭 git 镜像加速" if n else "本来就没有开启")
@@ -1479,7 +1518,7 @@ def _ssh_try(*target):
     cmd = ["ssh", "-T", "-o", "ConnectTimeout=8", "-o", "BatchMode=yes",
            "-o", "StrictHostKeyChecking=accept-new"] + list(target)
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        r = _run(cmd, timeout=30, capture_output=True, text=True)
     except FileNotFoundError:
         sys.exit("未找到 ssh 命令(Windows 请在「可选功能」里装 OpenSSH 客户端)")
     except Exception:
@@ -1582,8 +1621,8 @@ def dns_backup_file():
 
 
 def _mac_dns_services():
-    r = subprocess.run(["networksetup", "-listallnetworkservices"],
-                       capture_output=True, text=True)
+    r = _run(["networksetup", "-listallnetworkservices"], timeout=15,
+             capture_output=True, text=True)
     out = []
     for line in (r.stdout or "").splitlines()[1:]:
         line = line.strip()
@@ -1710,13 +1749,21 @@ def _dns_load_backup():
     return None, {}
 
 
-def _dns_current():
-    """[(服务/适配器名, 当前 DNS 列表或 None=自动获取)]"""
+_DNS_CACHE = {"t": 0.0, "items": []}
+
+
+def _dns_current(force=False):
+    """[(服务/适配器名, 当前 DNS 列表或 None=自动获取)]
+
+    Windows 上要拉 PowerShell,一次 ~2 秒;界面每次刷新都会问状态,
+    加个 5 秒缓存避免反复起进程(改 DNS 后会被强制失效)。"""
+    if not force and time.time() - _DNS_CACHE["t"] < 5:
+        return _DNS_CACHE["items"]
     out = []
     if IS_MAC:
         for svc in _mac_dns_services():
-            r = subprocess.run(["networksetup", "-getdnsservers", svc],
-                               capture_output=True, text=True)
+            r = _run(["networksetup", "-getdnsservers", svc], timeout=15,
+                     capture_output=True, text=True)
             txt = (r.stdout or "").strip()
             if txt.startswith("There aren't any DNS Servers"):
                 out.append((svc, None))
@@ -1727,9 +1774,10 @@ def _dns_current():
               "Where-Object {$_.ServerAddresses} | "
               "Select-Object InterfaceAlias,@{n='d';e={$_.ServerAddresses -join ','}} | "
               "ConvertTo-Json -Compress")
-        r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                           capture_output=True, text=True)
         try:
+            r = _run(["powershell", "-NoProfile", "-NonInteractive",
+                      "-Command", ps], timeout=20,
+                     capture_output=True, text=True)
             data = json.loads(r.stdout or "[]")
             if isinstance(data, dict):
                 data = [data]
@@ -1737,14 +1785,19 @@ def _dns_current():
                 out.append((it["InterfaceAlias"], it["d"].split(",")))
         except Exception:
             pass
+    _DNS_CACHE["t"], _DNS_CACHE["items"] = time.time(), out
     return out
 
 
 def _dns_apply(svc, servers):
     """写 DNS(不回读校验);返回 (是否成功, 错误摘要)——失败别再无声吞掉"""
+    _DNS_CACHE["t"] = 0.0   # 缓存失效,下次问系统真实态
     if IS_MAC:
         cmd = ["networksetup", "-setdnsservers", svc] + (servers or ["Empty"])
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        try:
+            r = _run(cmd, timeout=20, capture_output=True, text=True)
+        except Exception as e:
+            return False, str(e)[:80]
         if r.returncode != 0:
             return False, ((r.stderr or r.stdout or "").strip()
                            or "rc=%d" % r.returncode)[:80]
@@ -1753,8 +1806,12 @@ def _dns_apply(svc, servers):
         ps = ("Set-DnsClientServerAddress -InterfaceAlias '%s' " % svc.replace("'", "''")
               + ("-ServerAddresses (%s)" % ",".join("'%s'" % d for d in servers)
                  if servers else "-ResetServerAddresses"))
-        r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                           capture_output=True, text=True)
+        try:
+            r = _run(["powershell", "-NoProfile", "-NonInteractive",
+                      "-Command", ps], timeout=25,
+                     capture_output=True, text=True)
+        except Exception as e:
+            return False, str(e)[:80]
         if r.returncode != 0:
             return False, ((r.stderr or "").strip() or "rc=%d" % r.returncode)[:80]
         return True, ""
@@ -1817,7 +1874,10 @@ def sni_pac_text():
 
 
 def sni_pac_url():
-    return "file://" + SNI_PAC.replace(" ", "%20")
+    p = SNI_PAC.replace("\\", "/")
+    if not p.startswith("/"):
+        p = "/" + p                      # C:/Users/… → /C:/Users/…
+    return "file://" + p.replace(" ", "%20")
 
 
 def sni_pac_ours(url):
@@ -2063,12 +2123,27 @@ def _sni_run_server():
     return srv, th
 
 
+def _sni_close_server(srv):
+    """停 serve_forever 并真正关掉监听 socket —— 只 shutdown 不 close 的话
+    端口一直占着,下一次「开启」会误以为 relay 还活着。"""
+    try:
+        srv.shutdown()
+    except Exception:
+        pass
+    try:
+        srv.server_close()
+    except Exception:
+        pass
+    global _SNI_SERVER
+    if _SNI_SERVER is srv:
+        _SNI_SERVER = None
+
+
 def _sni_wait_stop(srv, th):
     """阻塞到 stop 哨兵出现或 relay 线程自然退出,然后收尾"""
     while th.is_alive() and not os.path.exists(SNI_STOP):
         th.join(0.4)
-    if th.is_alive():
-        srv.shutdown()          # 从别的线程停 serve_forever,安全
+    _sni_close_server(srv)
     try:
         os.remove(SNI_PID)
     except OSError:
@@ -2098,7 +2173,8 @@ def sni_start_inproc():
 
 
 def sni_request_stop():
-    """停 relay 的统一入口:写哨兵(独立进程轮询自停)+ 直接停本进程内线程"""
+    """停 relay 的统一入口:写哨兵(独立进程轮询自停)+ 停本进程内 relay。
+    同进程的 shutdown/close 交给后台线程做——调用方(界面线程)绝不能被阻塞。"""
     try:
         with open(SNI_STOP, "w") as f:
             f.write(str(os.getpid()))
@@ -2106,18 +2182,36 @@ def sni_request_stop():
         pass
     srv = _SNI_SERVER
     if srv is not None:
-        try:
-            srv.shutdown()
-        except Exception:
-            pass
+        threading.Thread(target=_sni_close_server, args=(srv,),
+                         daemon=True).start()
 
 
 def _sni_relay_alive():
     try:
-        socket.create_connection(("127.0.0.1", SNI_PORT), timeout=0.6).close()
+        socket.create_connection(("127.0.0.1", SNI_PORT), timeout=0.4).close()
         return True
     except OSError:
         return False
+
+
+def _sni_port_owner():
+    """谁在 LISTEN 我们的端口(只查一次 netstat,5 秒超时);查不到返回 None"""
+    if not IS_WIN:
+        return None
+    try:
+        r = _run(["netstat", "-ano", "-p", "TCP"], timeout=5,
+                 capture_output=True, text=True)
+    except Exception:
+        return None
+    for line in (r.stdout or "").splitlines():
+        parts = line.split()
+        if (len(parts) >= 5 and parts[3].upper() == "LISTENING"
+                and parts[1].rsplit(":", 1)[-1] == str(SNI_PORT)):
+            try:
+                return int(parts[4])
+            except ValueError:
+                pass
+    return None
 
 
 def _sni_spawn_relay():
@@ -2139,8 +2233,8 @@ def _sni_spawn_relay():
         cmd = ["/usr/bin/python3", os.path.abspath(__file__), "sni", "serve"]
         kw = {"start_new_session": True}
     try:
-        subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kw)
+        _popen(cmd, stdin=subprocess.DEVNULL,
+               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kw)
     except Exception:
         return False
     for _ in range(20):
@@ -2150,10 +2244,16 @@ def _sni_spawn_relay():
     return False
 
 
-def _sni_stop_relay():
-    """停 relay:先协作停止(哨兵+同进程 shutdown),再按 pid 补刀;
-    端口 3 秒内还不放就按命令行特征来一次(仅一次——wmic 在 Windows 上
-    一次 5~10 秒且新 Win11 已移除,循环重试会把「关闭加速」冻住几分钟)"""
+def _sni_stop_relay(deadline=5.0):
+    """停 relay:协作哨兵 → pidfile 补刀 → 端口归属补刀,全程有界(默认 5 秒)。
+    旧版兜底用 wmic:Win11 已移除、Win10 上 WMI 坏掉时一次能挂几十秒,
+    「关闭加速」就永远停在"正在关闭…"。现在只用 netstat + taskkill,秒级收工。"""
+    # 从没起过 relay(最常见的「关闭加速」):不写哨兵、不探端口,立即可回
+    if not (os.path.exists(SNI_PID) or os.path.exists(SNI_STOP)
+            or _SNI_SERVER is not None):
+        return False
+
+    t0 = time.monotonic()
     sni_request_stop()
     pid = None
     try:
@@ -2164,7 +2264,8 @@ def _sni_stop_relay():
     if pid and pid != os.getpid():
         try:
             if IS_WIN:
-                subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True)
+                _run(["taskkill", "/F", "/PID", str(pid)], timeout=4,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             else:
                 os.kill(pid, 15)
         except Exception:
@@ -2173,24 +2274,39 @@ def _sni_stop_relay():
         os.remove(SNI_PID)
     except Exception:
         pass
-    for _ in range(12):
-        if not _sni_relay_alive():
-            try:
-                os.remove(SNI_STOP)
-            except OSError:
-                pass
-            return
-        time.sleep(0.25)
-    try:   # 罕见:外部孤儿(不是我们起的)。补一刀;再不行就靠 DIRECT 兜底
-        if IS_WIN:
-            subprocess.run(["wmic", "process", "where",
-                            "CommandLine like '%sni serve%'", "call", "terminate"],
-                           capture_output=True)
-        else:
-            subprocess.run(["pkill", "-f", "sni serve"], capture_output=True)
-    except Exception:
-        pass
-    time.sleep(0.6)
+
+    def released():
+        return not _sni_relay_alive()
+
+    while time.monotonic() - t0 < deadline:
+        if released():
+            _sni_stop_cleanup()
+            return True
+        time.sleep(0.2)
+
+    # 罕见:外部孤儿,或安全软件把端口占着 → 按端口归属再补一刀
+    owner = _sni_port_owner()
+    if owner and owner != os.getpid():
+        try:
+            _run(["taskkill", "/F", "/T", "/PID", str(owner)], timeout=4,
+                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+    elif not IS_WIN:
+        try:
+            _run(["pkill", "-f", "sni serve"], timeout=4,
+                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+    for _ in range(5):
+        if released():
+            break
+        time.sleep(0.2)
+    _sni_stop_cleanup()
+    return not released()
+
+
+def _sni_stop_cleanup():
     try:
         os.remove(SNI_STOP)
     except OSError:
@@ -2254,8 +2370,8 @@ def _sni_backup_clear():
 
 def _mac_pac_get(svc):
     """networksetup -getautoproxyurl 输出纯文本两行:URL: … / Enabled: Yes|No"""
-    r = subprocess.run(["networksetup", "-getautoproxyurl", svc],
-                       capture_output=True, text=True)
+    r = _run(["networksetup", "-getautoproxyurl", svc], timeout=15,
+             capture_output=True, text=True)
     out = r.stdout or ""
     m = re.search(r"^URL:\s*(.*)$", out, re.M)
     en = re.search(r"^Enabled:\s*Yes\s*$", out, re.M) is not None
@@ -2293,7 +2409,10 @@ def _win_pac_set(url):
 
 
 def sni_pac_on():
-    """写系统 PAC。返回失败服务列表(mac)或 True/False(win)"""
+    """写 PAC 文件 + 指向它。返回失败服务列表(mac)或空列表(win)"""
+    os.makedirs(_SNI_DIR, exist_ok=True)
+    with open(SNI_PAC, "w", encoding="utf-8", newline="\n") as f:
+        f.write(sni_pac_text())
     if IS_WIN:
         prev = _win_pac_get()
         _sni_backup_write({"platform": "Windows", "autourl": prev})
@@ -2307,8 +2426,8 @@ def sni_pac_on():
     _sni_backup_write({"platform": "Darwin", "services": items})
     fail = []
     for s in items:
-        r = subprocess.run(["networksetup", "-setautoproxyurl", s, sni_pac_url()],
-                           capture_output=True, text=True)
+        r = _run(["networksetup", "-setautoproxyurl", s, sni_pac_url()],
+                 timeout=20, capture_output=True, text=True)
         if r.returncode != 0:
             fail.append("%s:%s" % (s, (r.stderr or r.stdout or "失败").strip()))
     return fail
@@ -2375,7 +2494,7 @@ def sni_off(quiet=False):
     """完整还原:停 relay → 还原 PAC → 清备份/缓存文件。返回是否动过东西"""
     if IS_LINUX:
         return False
-    _sni_stop_relay()
+    relay_stopped = _sni_stop_relay()
     try:
         n_res, n_sweep, fail = sni_pac_off()
     except SystemExit:
@@ -2387,8 +2506,10 @@ def sni_off(quiet=False):
         os.remove(SNI_PAC)
     except Exception:
         pass
-    moved = (n_res + n_sweep) > 0
-    journal("sni-off", "%d还原/%d清扫" % (n_res, n_sweep))
+    moved = (n_res + n_sweep) > 0 or relay_stopped
+    if moved or relay_stopped or fail:   # 什么都没开就别刷活动日志
+        journal("sni-off", "%d还原/%d清扫%s"
+                % (n_res, n_sweep, ",relay 已停" if relay_stopped else ""))
     if not quiet:
         if not moved:
             print("本来就未开启(系统里没有指向 ghspeed 的 PAC),无需还原")
