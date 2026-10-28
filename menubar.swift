@@ -310,6 +310,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         DispatchQueue.global().async { [weak self] in
             _ = runShell(engineUserCmd(["sni", "heal"]), timeout: 120)   // 启动自愈:孤儿 PAC 清扫 / relay 复活
             _ = runShell(engineUserCmd(["probe"]), timeout: 300)
+            _ = runShell(engineUserCmd(["mirrors"]), timeout: 300)   // 启动预热:镜像池过期就重验,首次下载零冷启动(后台,不弹窗)
             DispatchQueue.main.async {
                 self?.refreshUI()
                 guard let self = self else { return }

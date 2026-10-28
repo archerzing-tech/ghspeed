@@ -119,14 +119,16 @@ ghspeed status            查看固定 IP、延迟、守护状态 + 多级通道
 ghspeed probe             手动测速(不写 hosts)
 ghspeed mirrors           镜像健康检查(静态 + 动态池)
 ghspeed refresh           重测并更新 hosts(root / 管理员)
-ghspeed dl <url> [-o 路径] [--direct] [--min-speed KB/s] [--proxy http://127.0.0.1:7890]
-                          （≥8MB 自动切 8 片多通道并行下载,片级断点续传,失败退回单流链)
+ghspeed dl <url|owner/repo[@ref]> [-o 路径] [--direct] [--min-speed KB/s] [--proxy http://127.0.0.1:7890]
+                          （owner/repo 自动转整仓 zip 经最快镜像下;≥8MB 资产自动切
+                          8 片多通道并行,片级断点续传,失败退回单流链)
 ghspeed git on | off      git clone 走镜像(push 前记得 off)
 ghspeed ssh443 test|on|off   git 改走 ssh.github.com:443 官方备用 SSH 口
 ghspeed proxy             探测本机代理端口并给出接管命令(只检测,不接管)
 ghspeed dns on|off|show   系统 DNS 换干净公共 DNS(opt-in;off 永远可取消,没备份也能清扫回自动获取)
-ghspeed sni test|on|off|state   浏览器 SNI 分片(可选):ClientHello 拆散绕过识别,
-                          仅 GitHub 域走本地 relay;state 看状态,off 原样还原
+ghspeed sni test|on|off|state|git   浏览器 SNI 分片(可选):ClientHello 拆散绕过识别,
+                          仅 GitHub 域走本地 relay;`sni git on` 让 git clone/fetch
+                          也走分片 relay(只写 github.com 域级配置,off 原样还原)
 ghspeed live             看当前谁正连着钉选 IP(请求吃到加速的实时视图)
 ghspeed activity         回放 ghspeed 自身动作日志(下载通道/刷新/开关)
 ghspeed --version         版本号
@@ -152,9 +154,11 @@ ghspeed 按阶梯逐级兜底,`ghspeed status` 一次看清各级状态:
    候选 IP 除 DoH/内置网段外,还会拉**社区 hosts 源**(GitHub520/ineo6,6h 缓存),
    但一律过 TLS+SNI 真实验证才可能被钉上
 2. **动态镜像池** —— 下载/clone 的备胎。发布站(ghproxy.link)+ 已知家族域名做候选,
-   拿真实 release 资产逐个验证,**下单顺序按实测延迟排(动态序,快→慢)**;
+   拿真实 release 资产逐个验证,**下单顺序按实测吞吐排(256KB 真下载实测,
+   低延迟≠宽管道,下载快才算快;同吞吐再看延迟)**;
    静态默认序只是候选来源、不代表最快,免检入池不存在(静态也要过验证)。
-   24h 缓存;发布站够不着时沿用旧池不洗空
+   24h 缓存;发布站够不着时沿用旧池不洗空。两款 GUI 启动时后台预热,
+   首次下载零冷启动
 3. **ssh443** —— git 的活路。`ssh.github.com:443` 是 GitHub 官方备用 SSH 口,
    **不走 TLS、没有 SNI 可拦**,HTTPS 被整段丢弃的坏窗口里它通常还活着
    (先 `ghspeed ssh443 test` 验一把,通就 `on`,写入 `~/.ssh/config` 标记块,`off` 还原)
@@ -207,6 +211,7 @@ GHSPEED_MIRRORS="https://your-mirror.example.com/" ghspeed dl <url>
 
 ## 已知限制
 
+- codeload 的整仓 zip 是动态流式响应(无 Content-Length),`dl owner/repo` 不走分片并行,单流吃最快镜像;release 资产不受影响(≥8MB 照样 8 片并行)
 - `raw.githubusercontent.com` 与 `gist.github.com` 在部分网络受 SNI 级阻断(与 IP 无关),hosts 钉不住浏览器访问——这两个域的资源走镜像下载(`ghspeed dl` / 菜单下载);浏览器直连想试的话,`ghspeed sni on` 的分片 relay 有机会绕过识别型阻断(`sni test` 先看你的网络吃不吃这套)
 - 直连链路整段 TLS 被丢时(「坏窗口」,几分钟一变),github.com 可能暂时连不上——这是网络本身在摆动,不是加速失效。refresh 会保留旧钉不回退,macOS 菜单栏检测到波动还会自动重测(免密时);窗口一开就恢复
 - 镜像列表内置 4 个公共 ghproxy 系镜像,失效时用 `GHSPEED_MIRRORS` 自行替换

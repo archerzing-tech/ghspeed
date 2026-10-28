@@ -280,6 +280,10 @@ class App:
                 eng.sni_start_inproc()
         except Exception:
             pass
+        try:   # 启动预热:镜像池过期就后台重验(首次下载/clone 零冷启动);在本线程跑,不碰界面
+            eng.mirror_pool()
+        except Exception:
+            pass
 
     def toggle_sni(self):
         if self.busy:

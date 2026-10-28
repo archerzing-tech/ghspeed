@@ -160,8 +160,12 @@ jobs:
 
           ### 多级可访问性阶梯(HTTPS 被掐时逐级退守)
           1. hosts 钉 IP(候选含社区 hosts 源,验证后才入池)+ 动态镜像池(发布站拉取,
-             逐个验证,下单顺序按实测延迟排)
-          1.5 下载分片并行:≥8MB 自动切 8 片、轮转多通道,片级断点续传,失败退回单流链
+             逐个验证,下单顺序按实测吞吐排——低延迟≠宽管道;App 启动后台预热,首次下载零冷启动)
+          1.5 下载分片并行:≥8MB 自动切 8 片、轮转多通道,片级断点续传,失败退回单流链;
+             \`ghspeed dl owner/repo[@分支或tag]\` 整仓 zip 一条命令直接经最快镜像下
+             v0.4.12 新增:镜像链按实测吞吐排序;dl 支持 owner/repo 整仓速下;
+             sni git on 让 git clone/fetch 走分片 relay(域级配置,任何关闭都还原);
+             macOS/Windows 启动预热镜像池
           2. \`ghspeed ssh443 test\` → 通则 \`on\`:git 走 ssh.github.com:443,不走 TLS 无 SNI 可拦
           2.5 浏览器 SNI 分片(v0.4.7 新增,可选):\`ghspeed sni test\` 实测后 \`on\`——
              本地 relay 把 ClientHello 拆散绕过 SNI 识别,仅 GitHub 域分流(PAC 带 DIRECT

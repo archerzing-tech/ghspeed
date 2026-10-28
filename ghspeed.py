@@ -106,9 +106,9 @@ REFRESH_INTERVAL = 1800  # 秒
 try:
     with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "VERSION")) as _f:
-        __version__ = _f.read().strip() or "0.4.11"
+        __version__ = _f.read().strip() or "0.4.12"
 except Exception:
-    __version__ = "0.4.11"
+    __version__ = "0.4.12"
 
 # 只处理这些 GitHub 域名,一个都不多
 DOMAINS = [
@@ -411,8 +411,28 @@ def validate_mirror(prefix, timeout=8):
         return None
 
 
+def _mirror_speed(prefix, timeout=3.5, cap=262144):
+    """Range GET 真实资产前 256KB → B/s;限时定量(慢镜像采到哪算哪),
+    绝不吊住整轮验证。0 = 没测出(窄管道/不支持 Range),排序时自然沉底"""
+    try:
+        req = urllib.request.Request(prefix + MIRROR_TEST_URL, headers={
+            "User-Agent": UA, "Range": "bytes=0-%d" % (cap - 1)})
+        t0 = time.perf_counter()
+        got = 0
+        with urllib.request.urlopen(req, timeout=timeout, context=ssl_context()) as r:
+            while got < cap and time.perf_counter() - t0 <= timeout:
+                b = r.read(65536)
+                if not b:
+                    break
+                got += len(b)
+        dt = time.perf_counter() - t0
+        return got / dt if got >= 65536 and dt > 0 else 0.0
+    except Exception:
+        return 0.0
+
+
 def _pool_urls(entries):
-    """dyn["mirrors"] 兼容两代形态:旧 ["url"] / 新 [[url, rtt]](延迟序)→ 出 url 列表"""
+    """dyn["mirrors"] 兼容两代形态:旧 ["url"] / 新 [[url, rtt, mbps]](吞吐优先序)→ 出 url 列表"""
     out = []
     for e in entries:
         u = e[0] if isinstance(e, (list, tuple)) else e
@@ -422,9 +442,10 @@ def _pool_urls(entries):
 
 
 def mirror_pool(force=False):
-    """镜像下单链:静态种子 + 发布站动态候选,**一律真验证、按实测延迟排序**。
-    静态默认序只是候选来源,不代表最快——顺序以动态实测为准(快→慢)。
-    24h 缓存(连延迟一起存);源够不着/坏窗口全验不过时沿用旧池,永不洗空。"""
+    """镜像下单链:静态种子 + 发布站动态候选,**一律真验证、按实测吞吐排序**。
+    静态默认序只是候选来源,不代表最快——低延迟≠宽管道,下载快(吞吐)才算快,
+    延迟只做同吞吐时的次序。24h 缓存(连吞吐/延迟一起存);
+    源够不着/坏窗口全验不过时沿用旧池,永不洗空。"""
     env = os.environ.get("GHSPEED_MIRRORS")
     if env:   # 用户显式指定时完全尊重用户,不掺动态
         return [m.strip().rstrip("/") + "/" for m in env.split(",") if m.strip()]
@@ -454,12 +475,15 @@ def mirror_pool(force=False):
                 if u not in seen:
                     seen.add(u)
                     cands.append(u)
+    def _probe(p):   # 活性(HEAD) + 吞吐(256KB 实测)一次采齐
+        rtt = validate_mirror(p)
+        return (p, rtt, _mirror_speed(p) if rtt is not None else 0.0)
     alive = []
     with cf.ThreadPoolExecutor(10) as ex:
-        for p, rtt in ex.map(lambda p: (p, validate_mirror(p)), cands[:28]):
+        for p, rtt, sp in ex.map(_probe, cands[:28]):
             if rtt is not None:
-                alive.append((p, rtt))
-    alive.sort(key=lambda x: x[1])   # ★ 动态排序:实测延迟快的排前面
+                alive.append((p, rtt, sp))
+    alive.sort(key=lambda x: (-x[2], x[1]))   # ★ 动态排序:吞吐优先(下载快才是真快),延迟次之
     if alive:
         dyn["mirrors"], dyn["mirrors_ts"] = alive, now
         dyn_save(dyn)
@@ -1132,13 +1156,16 @@ MIRROR_TEST_URL = ("https://github.com/jqlang/jq/releases/download/"
 
 
 def cmd_mirrors(args):
-    print("镜像健康检查(HEAD 真实 release 资产 jq-linux-amd64):")
+    print("镜像健康检查(HEAD 活性 + 256KB 实测吞吐,真实 release 资产 jq-linux-amd64):")
     pool = mirror_pool()
+    _spd = {e[0]: (e[2] if len(e) > 2 else 0.0)
+            for e in (dyn_load().get("mirrors") or [])
+            if isinstance(e, (list, tuple))}
     print("(池子:静态 %d + 动态 %d,动态来源 %s,全部真验证过)"
           % (len([m for m in pool if m in set(MIRRORS)]),
              len([m for m in pool if m not in set(MIRRORS)]),
              "、".join(MIRROR_FEED_SOURCES)))
-    print("(下单链按实测延迟排序(动态序);静态默认序 %s 只是候选来源,不代表最快)"
+    print("(下单链按实测吞吐优先、延迟次之(动态序);静态默认序 %s 只是候选来源,不代表最快)"
           % " → ".join(urlparse(m).netloc for m in MIRRORS))
 
     def t(m):
@@ -1168,15 +1195,18 @@ def cmd_mirrors(args):
         else:
             name = urlparse(m).netloc + ("·静态" if m in MIRRORS else "·动态")
         if ms is not None:
-            print("  + %-30s %5.0f ms  HTTP %s" % (name, ms * 1000, code))
+            sp = _spd.get(m, 0.0) if m is not None else 0.0
+            print("  + %-30s %5.0f ms  HTTP %s%s"
+                  % (name, ms * 1000, code,
+                     ("  %5.1f MB/s" % (sp / 1e6)) if sp else ""))
             if m is not None and code == 200:
-                alive.append((ms, name))
+                alive.append((-(sp or 0.0), ms, name))   # 展示序与池子一致:吞吐优先,延迟次之
         else:
             print("  x %-30s %s" % (name, err))
 
     alive.sort()
     if alive:
-        print("\n推荐顺序:%s" % " → ".join(n for _, n in alive))
+        print("\n推荐顺序(吞吐优先):%s" % " → ".join(n for _, _, n in alive))
         print("自定义镜像:GHSPEED_MIRRORS=\"https://a.example.com/,https://b.example.com/\" "
               "ghspeed dl <url>")
 
@@ -1408,8 +1438,21 @@ def download_sharded(url, part, chain, min_speed=25.0, stall_s=12.0):
     return sum(done) - got0, time.time() - t0
 
 
+_REPO_SH_RE = re.compile(
+    r"^([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:@([A-Za-z0-9._/-]+))?$")
+
 def cmd_dl(args):
     url = args.url.strip()
+    if "://" not in url:
+        # owner/repo[@ref] 整仓捷径 → codeload zip:零 API 调用(HEAD=默认分支由
+        # codeload 自己解析),经镜像链+分片并行,坏窗口里下整仓最快的路
+        m = _REPO_SH_RE.match(url)
+        if not m:
+            sys.exit("不认识的地址:给完整 GitHub 链接,或 owner/repo[@分支或tag]")
+        o, r, ref = m.groups()
+        url = "https://codeload.github.com/%s/%s/zip/%s" % (o, r, ref or "HEAD")
+        print("==> 整仓下载 %s/%s%s(zip)" % (o, r, "@" + ref if ref else " 默认分支"))
+        args.output = args.output or ("%s-%s.zip" % (r, ref) if ref else "%s.zip" % r)
     if not GITHUB_URL_RE.match(url):
         sys.exit("只支持 GitHub 相关链接(github.com / *.githubusercontent.com / "
                  "*.githubassets.com / *.github.io);其他网站本工具一概不处理")
@@ -2530,11 +2573,70 @@ def sni_state():
             "strategy": sni_strategy()}
 
 
+_GIT_PROXY_KEY = "http.https://github.com/.proxy"   # 域级配置:只影响 github.com 的 HTTPS
+_GIT_PROXY_VAL = "http://127.0.0.1:%d" % SNI_PORT
+
+def _git_cfg_get():
+    try:
+        r = _run(["git", "config", "--global", "--get", _GIT_PROXY_KEY],
+                 timeout=10, text=True, capture_output=True)
+        return (r.stdout or "").strip() if r and r.returncode == 0 else ""
+    except Exception:
+        return ""
+
+def sni_git_on():
+    """git 的 github.com HTTPS(clone/fetch)走本地分片 relay:直连源站无镜像滞后,
+    ClientHello 照样拆散;push(ssh)不受影响。只写这一个域级配置,任何关闭都还原"""
+    if shutil.which("git") is None:
+        sys.exit("未找到 git")
+    if not _sni_relay_alive() and not _sni_spawn_relay():
+        sys.exit("relay 没起来:先 ghspeed sni on(或界面开启 SNI 分片)")
+    old = _git_cfg_get()
+    _run(["git", "config", "--global", "--replace-all", _GIT_PROXY_KEY, _GIT_PROXY_VAL],
+         timeout=15, check=True)
+    dyn = dyn_load()
+    dyn["git_proxy_backup"] = old or None
+    dyn_save(dyn)
+    journal("sni-git-on", "git github.com → 分片 relay 127.0.0.1:%d" % SNI_PORT)
+    print("已开启:git clone/fetch https://github.com/... 直连源站,经本地分片 relay")
+    print("  · relay 挂了 git 会连不上(无 DIRECT 兜底):ghspeed sni heal 自愈,或 sni git off 还原")
+    print("  · 还原:ghspeed sni git off(总 off / 界面关闭也会自动还原)")
+
+def sni_git_off(quiet=False):
+    cur = _git_cfg_get()
+    if cur != _GIT_PROXY_VAL:
+        if not quiet:
+            print("本来就未开启(当前值:%s),没动 git 配置" % (cur or "未设置"))
+        return False
+    old = dyn_load().get("git_proxy_backup")
+    try:
+        if old:
+            _run(["git", "config", "--global", "--replace-all", _GIT_PROXY_KEY, old],
+                 timeout=15)
+        else:
+            _run(["git", "config", "--global", "--unset-all", _GIT_PROXY_KEY], timeout=15)
+        dyn = dyn_load()
+        dyn.pop("git_proxy_backup", None)
+        dyn_save(dyn)
+        journal("sni-git-off", "git github.com 代理还原为%s" % ("原值" if old else "未设置"))
+    except Exception as e:
+        if not quiet:
+            print("还原 git 配置失败:%s(可手动:git config --global --unset-all %s)"
+                  % (e, _GIT_PROXY_KEY))
+        return False
+    if not quiet:
+        print("已还原:git 配置回到开启前的原值")
+    return True
+
 def sni_off(quiet=False):
-    """完整还原:停 relay → 还原 PAC → 清备份/缓存文件。返回是否动过东西"""
+    """完整还原:停 relay → 还原 PAC → 还原 git 域级代理 → 清备份/缓存文件。返回是否动过东西"""
     if IS_LINUX:
         return False
     relay_stopped = _sni_stop_relay()
+    try:
+        git_moved = sni_git_off(quiet=True)   # 开过 git-over-relay 就一并还原
+    except Exception:
+        git_moved = False
     try:
         n_res, n_sweep, fail = sni_pac_off()
     except SystemExit:
@@ -2555,6 +2657,8 @@ def sni_off(quiet=False):
             print("本来就未开启(系统里没有指向 ghspeed 的 PAC),无需还原")
             return False
         print("已还原:停 relay + PAC 还原 %d 个、清扫 %d 个 → 原样" % (n_res, n_sweep))
+        if git_moved:
+            print("已还原:git 的 github.com 代理配置 → 开启前原值")
         if fail:
             print("没动成的:%s(可再跑一次 sni off)" % ";".join(fail))
     return moved
@@ -2579,7 +2683,7 @@ def sni_heal(quiet=False):
 
 
 def cmd_sni(args):
-    if IS_LINUX and args.action in ("on", "off"):
+    if IS_LINUX and args.action in ("on", "off", "git"):
         sys.exit("Linux 桌面各发行版代理设置差异大,sni 暂只支持 macOS/Windows;"
                  "命令行可手动把浏览器 PAC 指到本地 relay:ghspeed sni state 看用法")
     if args.action == "test":
@@ -2607,6 +2711,17 @@ def cmd_sni(args):
         if sni_strategy() == "rotate":
             print("  · rotate = 每条连接轮换分片手法,不赌单一策略(ghspeed sni test 可固定)")
         print("  · 还原:ghspeed sni off(退出 App 也会自动还原)")
+    elif args.action == "git":
+        if args.git_action == "on":
+            sni_git_on()
+        elif args.git_action == "off":
+            sni_git_off()
+        else:
+            cur = _git_cfg_get()
+            st = sni_state()
+            print("git 走分片 relay:%s" % ("已开启" if cur == _GIT_PROXY_VAL else "未开启"))
+            print("relay:%s,策略:%s" % ("活着" if st["relay"] else "没在跑", st["strategy"]))
+            print("开:ghspeed sni git on   关:ghspeed sni git off")
     elif args.action == "off":
         sni_off()
     elif args.action == "heal":
@@ -2617,6 +2732,8 @@ def cmd_sni(args):
         print("relay:%s" % ("活着(127.0.0.1:%d)" % SNI_PORT if st["relay"]
                             else "没在跑(PAC 未开时不需要;开着则浏览器走 DIRECT 兜底)"))
         print("策略:%s(ghspeed sni test 重测)" % st["strategy"])
+        print("git 分片:%s(ghspeed sni git on 可选开)" %
+              ("已开启" if _git_cfg_get() == _GIT_PROXY_VAL else "未开启"))
         if st["enabled"] and not st["relay"]:
             print("⚠ 开着但 relay 不在:浏览器已自动回落直连;ghspeed sni heal 可自愈")
 
@@ -2688,7 +2805,7 @@ def main():
     p.set_defaults(func=cmd_refresh)
 
     p = sub.add_parser("dl", help="经镜像下载 GitHub 文件(支持断点续传)")
-    p.add_argument("url", help="release/raw/archive 等 GitHub 链接")
+    p.add_argument("url", help="GitHub 链接,或 owner/repo[@分支或tag] 整仓速下(zip)")
     p.add_argument("-o", "--output", help="保存路径(默认取 URL 文件名)")
     p.add_argument("--mirror", help="指定镜像前缀")
     p.add_argument("--direct", action="store_true", help="不走镜像,只直连")
@@ -2721,8 +2838,10 @@ def main():
     p.set_defaults(func=cmd_dns)
 
     p = sub.add_parser("sni", help="浏览器 SNI 分片(可选):ClientHello 拆散绕过识别,仅 GitHub 域走本地 relay;任何关闭都原样还原")
-    p.add_argument("action", choices=["test", "on", "off", "state", "heal", "serve"],
+    p.add_argument("action", choices=["test", "on", "off", "state", "heal", "serve", "git"],
                    nargs="?", default="state")
+    p.add_argument("git_action", choices=["on", "off"], nargs="?", default=None,
+                   help=argparse.SUPPRESS)
     p.set_defaults(func=cmd_sni)
 
     if IS_WIN and len(sys.argv) == 1:
