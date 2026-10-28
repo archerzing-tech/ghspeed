@@ -239,6 +239,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var sniItem: NSMenuItem!
     var actionItems: [NSMenuItem] = []
     var busy = false
+    var busyT0: Date?
     var downloading = false
     var timer: Timer?
     var lastHeal = Date.distantPast   // 坏窗口自动重测的限流
@@ -451,16 +452,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func setBusy(_ b: Bool) {
+        // busy 只拦逻辑,不灰菜单项:永远可点,点了给通知(用户反馈:全灰像死了)
         busy = b
-        DispatchQueue.main.async {
-            for it in self.actionItems { it.isEnabled = !b }
-        }
+        if b { busyT0 = Date() }
+    }
+
+    func noteBusy() {
+        let secs = busyT0.map { Int(Date().timeIntervalSince($0)) } ?? 0
+        notify("GitHub 加速", "⏳ 上一项还在跑(\(secs) 秒),完成前先别切")
     }
 
     // ---- 动作 ----
 
     @objc func toggle(_ s: Any) {
-        if busy { return }
+        if busy { noteBusy(); return }
         let (on, _) = hostsOn()
         let act = on ? "off" : "on"
         setBusy(true)
@@ -477,7 +482,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func refreshNow(_ s: Any) {
-        if busy { return }
+        if busy { noteBusy(); return }
         setBusy(true)
         statusLine.title = "⏳ 正在测速(通常几秒)…"
         adminEngine(["refresh"]) { ok, out in
@@ -488,7 +493,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func checkMirrors(_ s: Any) {
-        if busy { return }
+        if busy { noteBusy(); return }
         setBusy(true)
         DispatchQueue.global().async {
             let r = runEngineMirrors()
@@ -597,7 +602,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // 系统 DNS 接管:opt-in(影响全部网站),原配置自动备份,再点一次原样还原
     @objc func toggleDNS(_ s: Any) {
-        if busy { return }
+        if busy { noteBusy(); return }
         let on = dnsOn()
         if !on {
             let alert = NSAlert()
@@ -627,7 +632,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func toggleSNI(_ s: Any) {
-        if busy { return }
+        if busy { noteBusy(); return }
         let on = sniOn()
         setBusy(true)
         statusLine.title = on ? "⏳ 正在还原 SNI 分片…"
@@ -653,7 +658,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func quit(_ s: Any) {
-        if busy { return }   // 正在执行的动作没落地前不退,防半截状态
+        if busy { noteBusy(); return }   // 正在执行的动作没落地前不退,防半截状态
         if sniOn() {         // 生命周期契约:退出即还原(弹一次授权;取消则下次启动自愈兜底)
             let argv = engineUserCmd(["sni", "off"])
             _ = adminShell(argv.joined(separator: " "),

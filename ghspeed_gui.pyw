@@ -131,14 +131,21 @@ class App:
         return -1, ""
 
     def set_busy(self, b):
+        # busy 只拦逻辑,不再灰按钮:界面永远可点,点了给提示(用户反馈:全灰像死了)
         self.busy = b
-        for w in (self.toggle_btn, self.refresh_btn, self.diag_btn):
-            w.config(state="disabled" if b else "normal")
+        if b:
+            self._busy_t0 = time.time()
+
+    def note_busy(self):
+        t0 = getattr(self, "_busy_t0", None)
+        self.status.config(text="⏳ 上一项还在跑(%d 秒),状态行有实时进度;完成前先别切"
+                           % (int(time.time() - t0) if t0 else 0), fg="#b58900")
 
     # ---------------- 动作 ----------------
 
     def toggle(self):
         if self.busy:
+            self.note_busy()
             return
         if self.hosts_on():
             if not eng.is_admin():   # 改 hosts 要管理员:提权后再关,别让用户干瞪眼
@@ -212,6 +219,7 @@ class App:
 
     def refresh_now(self):
         if self.busy:
+            self.note_busy()
             return
         ok = ("测速完成,已更新最优 IP ✅" if eng.is_admin() else
               "测速完成(未提权,仅更新缓存;固定 hosts 请点「开启加速」)")
@@ -220,6 +228,7 @@ class App:
 
     def check_mirrors(self):
         if self.busy:
+            self.note_busy()
             return
         self.set_busy(True)
         self.status.config(text="⏳ 正在检测镜像…", fg="#b58900")
@@ -247,6 +256,7 @@ class App:
 
     def toggle_dns(self):
         if self.busy:
+            self.note_busy()
             return
         turning_on = not self.dns_on()   # 点按钮即切换,不弹确认窗;再点一次原样还原
         if not eng.is_admin():
@@ -287,6 +297,7 @@ class App:
 
     def toggle_sni(self):
         if self.busy:
+            self.note_busy()
             return
         try:
             turning_on = not eng.sni_state()["enabled"]   # 点按钮即切换,不弹确认窗
@@ -329,6 +340,7 @@ class App:
     def run_diag(self):
         """多级通道自检:hosts/镜像池/ssh443/本地代理/DNS/SNI/活动连接 一次看清"""
         if self.busy:
+            self.note_busy()
             return
         self.set_busy(True)
         self.status.config(text="⏳ 正在自检多级通道…", fg="#b58900")
