@@ -2,6 +2,11 @@
 
 GitHub 加速工具:测速固定最快 IP + 镜像加速下载,只解决 GitHub 的问题,不碰其他任何网络。
 
+与「抄一份 hosts」的方案不同,这里**所有候选一律先验证再使用**:IP 过 TLS 证书校验
+(防污染——社区 hosts 源实测含脏数据,如 fastly 域名指到 Twitter 段),镜像拿真实
+release 资产回源实测(防「根路径活着但代理是死的」),测速失败还会给出**病因分类**
+(污染 / SNI 识别 / 丢包 / IP 被封),坏窗口和封锁升级都能一眼定位。
+
 | 平台 | 界面 | 最低要求 |
 |---|---|---|
 | macOS | 菜单栏 🐙 | 10.13+ |
@@ -22,10 +27,15 @@ GitHub 加速工具:测速固定最快 IP + 镜像加速下载,只解决 GitHub 
 
 1. **加快访问 github** — 并发探测已知 GitHub 网段 + DoH 解析结果,按域名做 TLS 握手测速(证书验证防污染 IP),把最快 IP 写入 hosts 标记块,并装定时任务每 30 分钟自动重测换优
 2. **加速 GitHub 下载** — ≥8MB 自动切 8 片、多通道并行(每片独立选镜像/直连,片级断点续传);
-   小文件走 ghproxy 系镜像回退链 + 直连兜底,停滞/低速自动换通道
+   小文件走 ghproxy 系镜像回退链 + 直连兜底,停滞/低速自动换通道。
+   镜像池带**跨会话记忆评分**(吞吐 EMA、7 天没成功自动出局),清单定期实测换血
+   (公共镜像平均寿命一两年,ghproxy.com / FastGit / kkgithub 等均已死)
 3. **打不开变能打开** — 链路在好坏窗口间摆动(TCP 通、TLS 间歇被丢)时,测速器跨窗口多轮重试,好窗口一到就把 IP 钉住
+4. **看得见的诊断** — `ghspeed status` 一屏自检全部通道、列出长期不通的域名及替代走法;
+   测速失败报病因;`live` 看谁的连接正吃着加速,`activity` 回放自身动作
 
-三平台同一份 Python 引擎(`ghspeed.py`),hosts / 定时刷新 / DNS 缓存 / 提权方式按平台自动适配(launchd / systemd / 计划任务)。
+三平台同一份 Python 引擎(`ghspeed.py`,SNI 分片等非核心特性拆为按需加载的
+[可选插件](ghspeed_sni.py)),hosts / 定时刷新 / DNS 缓存 / 提权方式按平台自动适配(launchd / systemd / 计划任务)。
 
 ## 安装
 
@@ -238,7 +248,7 @@ GHSPEED_MIRRORS="https://your-mirror.example.com/" ghspeed dl <url>
 
 Linux `.deb` 与 Windows `.zip` 由 CI(打 `v*` 标签)构建,脚本见 `.github/workflows/release.yml`;Windows 界面为标准库 tkinter,无需额外依赖。
 
-App 自包含 `ghspeed.py` 引擎;三平台共用同一引擎文件。
+App 自包含 `ghspeed.py` 引擎与可选插件 `ghspeed_sni.py`;三平台共用同一套引擎文件。
 
 ## License
 
