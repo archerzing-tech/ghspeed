@@ -136,6 +136,18 @@ jobs:
 
           GitHub 专用加速工具:测速固定最快 IP 到 hosts + 镜像加速下载。只碰 GitHub,不碰其他网络。
 
+          ### v0.5.0 变更(地基重整版)
+          - **镜像池跨会话记忆评分**:每次验证/下载成败都入账(吞吐 EMA、累计成败、
+            最近成功时间),排序实测优先、历史次之,7 天没成功过的自动出局
+          - **镜像候选清单 2026-10 实测换血**:ghproxy 公共镜像生态平均寿命一两年,
+            死透的(gh.llkk.cc / ghp.ci / ghproxy.cc 等 7 个)移除不留尸位
+          - `ghspeed mirrors --export`:把实测通过的池导出为带时间戳的 JSON
+            (全生态没有活的「自动健康检查镜像列表」,ghspeed 的验证池可以补位)
+          - `ghspeed url`:一键把 GitHub 链接展开成直连 + 各镜像前缀的等价下载链接
+          - **测速失败报病因**:证书不匹配(污染)/ TLS 握手失败(SNI)/ 无响应(丢包)/
+            TCP 不通(IP 被封),probe 与 status 可见,封锁升级时能第一时间自查
+          - hosts 块带 Update time 行;status 显示长期不通的域名及替代走法
+
           ### macOS(菜单栏 🐙)
           1. 下载 `GHSpeed-macos-*.pkg` 双击安装;被 Gatekeeper 拦截就先
              `xattr -d com.apple.quarantine ~/Downloads/GHSpeed-macos-*.pkg`

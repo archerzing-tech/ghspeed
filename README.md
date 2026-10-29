@@ -117,7 +117,8 @@ sudo ghspeed off                 # 完全还原
 ghspeed on | off          开启/关闭(还原 hosts 与定时任务)
 ghspeed status            查看固定 IP、延迟、守护状态 + 多级通道自检
 ghspeed probe             手动测速(不写 hosts)
-ghspeed mirrors           镜像健康检查(静态 + 动态池)
+ghspeed mirrors [--export 文件]  镜像健康检查(带跨会话记忆评分;--export 把实测池导出为 JSON)
+ghspeed url <链接|owner/repo>    把链接展开成直连 + 各镜像前缀的等价下载链接
 ghspeed refresh           重测并更新 hosts(root / 管理员)
 ghspeed dl <url|owner/repo[@ref]> [-o 路径] [--direct] [--min-speed KB/s] [--proxy http://127.0.0.1:7890]
                           （owner/repo 自动转整仓 zip 经最快镜像下;≥8MB 资产自动切
@@ -158,7 +159,13 @@ ghspeed 按阶梯逐级兜底,`ghspeed status` 一次看清各级状态:
    低延迟≠宽管道,下载快才算快;同吞吐再看延迟)**;
    静态默认序只是候选来源、不代表最快,免检入池不存在(静态也要过验证)。
    24h 缓存;发布站够不着时沿用旧池不洗空。两款 GUI 启动时后台预热,
-   首次下载零冷启动
+   首次下载零冷启动。池子带**跨会话记忆**:每次验证/下载成败都入账
+   (吞吐 EMA、累计成败、最近成功时间),排序实测优先、历史次之,
+   7 天没成功过的自动出局;`ghspeed mirrors --export` 可把实测通过的池
+   导出成带时间戳的 JSON。公共镜像平均寿命一两年(ghproxy.com / FastGit /
+   kkgithub / moeyy 前缀均已死),清单 2026-10 实测换血,死了的不留尸位;
+   终极自保:花 10 分钟自部署 [hunshcn/gh-proxy](https://github.com/hunshcn/gh-proxy)
+   的 Cloudflare Worker 私有前缀,填进 `GHSPEED_MIRRORS` 即不依赖任何公共站
 3. **ssh443** —— git 的活路。`ssh.github.com:443` 是 GitHub 官方备用 SSH 口,
    **不走 TLS、没有 SNI 可拦**,HTTPS 被整段丢弃的坏窗口里它通常还活着
    (先 `ghspeed ssh443 test` 验一把,通就 `on`,写入 `~/.ssh/config` 标记块,`off` 还原)
@@ -214,7 +221,8 @@ GHSPEED_MIRRORS="https://your-mirror.example.com/" ghspeed dl <url>
 - codeload 的整仓 zip 是动态流式响应(无 Content-Length),`dl owner/repo` 不走分片并行,单流吃最快镜像;release 资产不受影响(≥8MB 照样 8 片并行)
 - `raw.githubusercontent.com` 与 `gist.github.com` 在部分网络受 SNI 级阻断(与 IP 无关),hosts 钉不住浏览器访问——这两个域的资源走镜像下载(`ghspeed dl` / 菜单下载);浏览器直连想试的话,`ghspeed sni on` 的分片 relay 有机会绕过识别型阻断(`sni test` 先看你的网络吃不吃这套)
 - 直连链路整段 TLS 被丢时(「坏窗口」,几分钟一变),github.com 可能暂时连不上——这是网络本身在摆动,不是加速失效。refresh 会保留旧钉不回退,macOS 菜单栏检测到波动还会自动重测(免密时);窗口一开就恢复
-- 镜像列表内置 4 个公共 ghproxy 系镜像,失效时用 `GHSPEED_MIRRORS` 自行替换
+- 测速失败时会报**病因分类**(证书不匹配=污染 IP / TLS 握手失败=SNI 识别 / 无响应=被丢包 / TCP 不通=IP 被封),`ghspeed probe` 与 status 里可见——审查手段在演进,先能说清是哪种病
+- 镜像清单 2026-10 实测换血(死透的移除,只留验证活着的),且带跨会话记忆评分;仍失效时用 `GHSPEED_MIRRORS` 自行替换(自部署 Worker 见上文「动态镜像池」)
 
 ## 构建
 

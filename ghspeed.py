@@ -106,9 +106,9 @@ REFRESH_INTERVAL = 1800  # 秒
 try:
     with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "VERSION")) as _f:
-        __version__ = _f.read().strip() or "0.4.13"
+        __version__ = _f.read().strip() or "0.5.0"
 except Exception:
-    __version__ = "0.4.13"
+    __version__ = "0.5.0"
 
 # 只处理这些 GitHub 域名,一个都不多
 DOMAINS = [
@@ -134,12 +134,19 @@ DOH_PROVIDERS = [
     "https://120.53.53.53/dns-query?name={d}&type=A",
 ]
 
-# 下载镜像(ghproxy 系)静态种子:冷启动/发布站也够不着时的保底
+# 下载镜像(ghproxy 系)静态种子:冷启动/发布站也够不着时的保底。
+# 2026-10-29 全量实测换血——ghproxy 公共镜像生态平均寿命只有一两年
+# (ghproxy.com / FastGit / kkgithub / moeyy 前缀 / gitclone.com 均已死),
+# 清单只留当时真验证过的;死透的不留尸位,省掉冷启动每轮的无谓探测:
+#   gh.llkk.cc(DNS 污染)、ghp.ci、ghproxy.cc、gh-proxy.net、
+#   ghproxy.homeboyc.cn、cdn.gh-proxy.com、gh.ddlc.top(验证全败)
+# 这里只是候选来源,入池仍逐个真验证——死了进不来,复活自然回来。
 MIRRORS = [
     "https://gh-proxy.com/",
     "https://ghproxy.net/",
     "https://ghfast.top/",
-    "https://gh.llkk.cc/",
+    "https://ghproxy.cn/",
+    "https://cors.isteed.cc/",
 ]
 
 # ---------------- 动态节点池(节点必须能定期更新,不能是死的) ----------------
@@ -154,16 +161,8 @@ MIRROR_FEED_SOURCES = ["https://ghproxy.link/"]
 # 发布站页面是 JS 渲染的,静态抓只能看到零星几个,再把已知家族域名直接
 # 列为种子候选;入池前同样逐个验证,死了的自然进不来
 MIRROR_EXTRA_CANDIDATES = [
-    "https://ghp.ci/",
-    "https://ghproxy.cn/",
-    "https://ghproxy.cc/",
-    "https://gh-proxy.net/",
-    "https://ghproxy.homeboyc.cn/",
-    # ghproxy.link 社区表里的公共节点(2026-10-26 实测 cors.isteed 活、
-    # gh-proxy.isteed.cc 连不上,以 cors 为准;死活最终以入池验证为准)
-    "https://cdn.gh-proxy.com/",
-    "https://cors.isteed.cc/",
-    "https://gh.ddlc.top/",
+    # gh.b52m.cn:2026-10-29 境外探测存活的小站(稳定性未知,验证说了算)
+    "https://gh.b52m.cn/",
 ]
 MIRROR_FEED_TTL = 86400      # 镜像池 24h 重拉
 
@@ -441,6 +440,53 @@ def _pool_urls(entries):
     return out
 
 
+# 镜像不是验证一次就一劳永逸:公共镜像平均寿命一两年,上周的冠军这周可能
+# 就死了。评分表(存 dyn.json)把每次真实交互——池子验证、单流下载成败——
+# 记成跨会话的记忆:吞吐 EMA、累计成败、最近成功时间。7 天没成功过的
+# 自动退出下单链(记录保留,复活验证通过自然回来)。
+MIRROR_SCORE_EVICTION = 7 * 86400
+
+
+def mirror_record_batch(results):
+    """把一批 (镜像, 成败, 吞吐B/s) 记进评分表;一次落盘,别每条一写。"""
+    if not results:
+        return
+    dyn = dyn_load()
+    st = dyn.get("mirror_stats") or {}
+    now = time.time()
+    for m, ok, mbps in results:
+        s = st.get(m) or {"ema": 0, "ok": 0, "fail": 0, "last_ok": 0}
+        if ok:
+            if mbps:   # 有吞吐才更新 EMA(HEAD 级成功也算活,但不冲淡历史吞吐)
+                s["ema"] = int(mbps) if not s["ema"] \
+                    else int(0.6 * mbps + 0.4 * s["ema"])
+            s["ok"] = s.get("ok", 0) + 1
+            s["fail"] = 0
+            s["last_ok"] = now
+        else:
+            s["fail"] = s.get("fail", 0) + 1
+        st[m] = s
+    dyn["mirror_stats"] = st
+    dyn_save(dyn)
+
+
+def _pool_rank(alive, stats):
+    """下单链排序:本次实测吞吐优先,历史 EMA 次之(冷启动时的记忆权重),
+    延迟殿后;7 天没成功过的剔除(验证这轮本来就过不了才会走到这)。"""
+    now = time.time()
+
+    def key(e):
+        p, rtt = e[0], e[1]
+        mbps = e[2] if len(e) > 2 else 0.0
+        s = stats.get(p) or {}
+        return (-mbps, -(s.get("ema") or 0), rtt if rtt is not None else 9e9)
+
+    out = [e for e in alive
+           if not ((stats.get(e[0]) or {}).get("last_ok")
+                   and now - stats[e[0]]["last_ok"] > MIRROR_SCORE_EVICTION)]
+    return sorted(out, key=key)
+
+
 def mirror_pool(force=False):
     """镜像下单链:静态种子 + 发布站动态候选,**一律真验证、按实测吞吐排序**。
     静态默认序只是候选来源,不代表最快——低延迟≠宽管道,下载快(吞吐)才算快,
@@ -478,12 +524,15 @@ def mirror_pool(force=False):
     def _probe(p):   # 活性(HEAD) + 吞吐(256KB 实测)一次采齐
         rtt = validate_mirror(p)
         return (p, rtt, _mirror_speed(p) if rtt is not None else 0.0)
-    alive = []
+    alive, seen_r = [], []
     with cf.ThreadPoolExecutor(10) as ex:
         for p, rtt, sp in ex.map(_probe, cands[:28]):
+            seen_r.append((p, rtt is not None, sp))   # 成败都入账:失败也是记忆
             if rtt is not None:
                 alive.append((p, rtt, sp))
-    alive.sort(key=lambda x: (-x[2], x[1]))   # ★ 动态排序:吞吐优先(下载快才是真快),延迟次之
+    mirror_record_batch(seen_r)
+    alive = _pool_rank(alive, dyn.get("mirror_stats") or {})
+    # ★ 动态排序:吞吐优先(下载快才是真快),历史 EMA 次之,延迟殿后
     if alive:
         dyn["mirrors"], dyn["mirrors_ts"] = alive, now
         dyn_save(dyn)
@@ -610,26 +659,46 @@ def candidates_for(domain, cap=18):
 PROBE_TIMEOUT = 2.5   # 好窗口里 TLS 握手 <1s;坏窗口等再久也是白等,收紧
 
 
+def _fail_kind(exc):
+    """一次探测失败的病因归类(只做诊断输出,不参与选路)。
+    审查在演进(QUIC-SNI 阻断 2024 已落地,TCP-SNI 升级是时间问题),
+    把「连不上」拆成病因,封锁升级时用户能第一时间自查。"""
+    if isinstance(exc, ssl.SSLCertVerificationError):
+        return "证书不匹配(污染 IP)"
+    if isinstance(exc, ssl.SSLError):
+        return "TLS 握手失败(SNI 识别?)"
+    if isinstance(exc, ConnectionResetError):
+        return "连接被重置"
+    if isinstance(exc, socket.timeout):
+        return "无响应(被丢包)"
+    if isinstance(exc, OSError):
+        return "TCP 不通(IP 被封)"
+    return "其他"
+
+
 def wave(pairs):
-    """并行探测一批 (domain, ip),返回 {domain: (rtt, ip) 中的最优}。
+    """并行探测一批 (domain, ip),返回 ({domain: (rtt, ip) 中的最优}, {domain: 病因计数})。
 
     所有域名共享一个线程池(旧版逐域名各开一个池再串行排队,
     13 个域名要等 13 轮);坏 IP 在 PROBE_TIMEOUT 内出局,不拖全局。
     """
-    out = {}
+    out, diag = {}, {}
 
     def one(job):
         d, ip = job
         try:
             return (d, ip, probe(d, ip, timeout=PROBE_TIMEOUT))
-        except Exception:
+        except Exception as e:
+            k = _fail_kind(e)
+            diag.setdefault(d, {})
+            diag[d][k] = diag[d].get(k, 0) + 1
             return (d, ip, None)
 
     with cf.ThreadPoolExecutor(max_workers=48) as ex:
         for d, ip, rtt in ex.map(one, pairs):
             if rtt is not None and (d not in out or rtt < out[d][0]):
                 out[d] = (rtt, ip)
-    return out
+    return out, diag
 
 
 def find_best(progress=False, on_round=None):
@@ -659,11 +728,19 @@ def find_best(progress=False, on_round=None):
             print("  x %-38s 本轮候选 IP 均不可达" % d, flush=True)
 
     state = {}
+    diag_all = {}   # 域名 -> {病因: 次数},全轮失败的域名据此报病因
+
+    def merge_diag(dg):
+        for d, ks in dg.items():
+            t = diag_all.setdefault(d, {})
+            for k, n in ks.items():
+                t[k] = t.get(k, 0) + n
 
     # 种子轮:上一轮的冠军 IP
     seeds = [(d, prev[d]["ip"]) for d in DOMAINS if prev.get(d, {}).get("ip")]
     if seeds:
-        r = wave(seeds)
+        r, dg = wave(seeds)
+        merge_diag(dg)
         for d, (rtt, ip) in r.items():
             state[d] = {"ip": ip, "rtt_ms": round(rtt * 1000)}
         report(sorted(r), [d for d, _ in seeds if d not in r])
@@ -686,7 +763,8 @@ def find_best(progress=False, on_round=None):
                       % (pause, len(pending)), flush=True)
             time.sleep(pause)
         if pending:
-            r = wave([(d, ip) for d in pending for ip in candidates_for(d)])
+            r, dg = wave([(d, ip) for d in pending for ip in candidates_for(d)])
+            merge_diag(dg)
             for d, (rtt, ip) in r.items():
                 state[d] = {"ip": ip, "rtt_ms": round(rtt * 1000)}
             report(sorted(r), [d for d in pending if d not in r])
@@ -701,6 +779,11 @@ def find_best(progress=False, on_round=None):
         if d in state:
             dead.pop(d, None)
         else:
+            if progress and diag_all.get(d):   # 病因见人话:手工 probe 时才打印/记录
+                top = max(diag_all[d].items(), key=lambda kv: kv[1])
+                print("  ! %-38s 主要病因:%s(×%d)"
+                      % (d, top[0], top[1]), flush=True)
+                journal("link", "%s 本轮全败,病因:%s×%d" % (d, top[0], top[1]))
             dead[d] = dead.get(d, 0) + 1
     return state, dead
 
@@ -724,7 +807,8 @@ def merge_with_existing(state):
 
 def hosts_block(state):
     hint = "ghspeed off 可整体移除" if IS_WIN else "sudo ghspeed off 可整体移除"
-    lines = [MARK_S, "# ghspeed 自动生成,勿手改;" + hint]
+    lines = [MARK_S, "# ghspeed 自动生成,勿手改;" + hint,
+             "# Update time: " + time.strftime("%Y-%m-%d %H:%M:%S %Z")]
     for d in sorted(state):
         lines.append("%s %s" % (state[d]["ip"], d))
     lines.append(MARK_E)
@@ -1109,6 +1193,10 @@ def cmd_status(args):
     print("\n多级通道自检:")
     print("  ① hosts 钉 IP    %s" % ("已开启,钉 %d 个域名" % len(in_hosts)
           if in_hosts else "未开启"))
+    dead = (load_seeds() or {}).get("dead") or {}
+    if dead:
+        print("     ⚠ 长期不通 %d 个:%s——资源走镜像下载(ghspeed dl),浏览器可试 sni on"
+              % (len(dead), "、".join(sorted(dead))))
     dyn = dyn_load()
     cpool, cts = dyn.get("mirrors") or [], dyn.get("mirrors_ts")
     feeds, fts = dyn.get("feed_ips") or {}, dyn.get("ips_ts")
@@ -1155,12 +1243,25 @@ MIRROR_TEST_URL = ("https://github.com/jqlang/jq/releases/download/"
                    "jq-1.7.1/jq-linux-amd64")
 
 
+def _fmt_when(ts):
+    if not ts:
+        return "从未"
+    d = time.time() - ts
+    if d >= 86400:
+        return "%.0f 天前" % (d / 86400)
+    if d >= 3600:
+        return "%.0f 小时前" % (d / 3600)
+    return "%.0f 分钟前" % (d / 60)
+
+
 def cmd_mirrors(args):
     print("镜像健康检查(HEAD 活性 + 256KB 实测吞吐,真实 release 资产 jq-linux-amd64):")
     pool = mirror_pool()
+    dyn = dyn_load()
     _spd = {e[0]: (e[2] if len(e) > 2 else 0.0)
-            for e in (dyn_load().get("mirrors") or [])
+            for e in (dyn.get("mirrors") or [])
             if isinstance(e, (list, tuple))}
+    stats = dyn.get("mirror_stats") or {}
     print("(池子:静态 %d + 动态 %d,动态来源 %s,全部真验证过)"
           % (len([m for m in pool if m in set(MIRRORS)]),
              len([m for m in pool if m not in set(MIRRORS)]),
@@ -1186,6 +1287,11 @@ def cmd_mirrors(args):
     with cf.ThreadPoolExecutor(8) as ex:
         for m, (ms, code, err) in zip(chain, ex.map(t, chain)):
             results.append((m, ms, code, err))
+    # 这轮 HEAD 检查本身也是真实交互:入账(池子缓存命中、验证环节被跳过时,
+    # 这里就是记忆的唯一入口)
+    mirror_record_batch([(m, ms is not None and code == 200, 0.0)
+                         for m, ms, code, err in results if m is not None])
+    stats = dyn_load().get("mirror_stats") or stats   # 入账后读回,展示即最新
 
     print()
     alive = []
@@ -1196,9 +1302,13 @@ def cmd_mirrors(args):
             name = urlparse(m).netloc + ("·静态" if m in MIRRORS else "·动态")
         if ms is not None:
             sp = _spd.get(m, 0.0) if m is not None else 0.0
-            print("  + %-30s %5.0f ms  HTTP %s%s"
+            s = stats.get(m) or {}
+            print("  + %-30s %5.0f ms  HTTP %s%s%s"
                   % (name, ms * 1000, code,
-                     ("  %5.1f MB/s" % (sp / 1e6)) if sp else ""))
+                     ("  %5.1f MB/s" % (sp / 1e6)) if sp else "",
+                     ("  [记忆 ok %d·败 %d·最近成功 %s]"
+                      % (s.get("ok", 0), s.get("fail", 0),
+                         _fmt_when(s.get("last_ok")))) if m is not None else ""))
             if m is not None and code == 200:
                 alive.append((-(sp or 0.0), ms, name))   # 展示序与池子一致:吞吐优先,延迟次之
         else:
@@ -1209,6 +1319,33 @@ def cmd_mirrors(args):
         print("\n推荐顺序(吞吐优先):%s" % " → ".join(n for _, _, n in alive))
         print("自定义镜像:GHSPEED_MIRRORS=\"https://a.example.com/,https://b.example.com/\" "
               "ghspeed dl <url>")
+
+    if getattr(args, "export", None):
+        doc = {
+            "_note": "ghspeed 实测通过的镜像池(逐个真验证:能回源 GitHub release 资产)。"
+                     "公共镜像生死随时段变化,引用方请自行定期复验。",
+            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "ghspeed": __version__,
+            "test_url": MIRROR_TEST_URL,
+            "mirrors": [
+                {"url": e[0],
+                 "rtt_ms": round(e[1] * 1000) if len(e) > 1 and e[1] else None,
+                 "mbps": round(e[2], 1) if len(e) > 2 else None,
+                 "ok": (stats.get(e[0]) or {}).get("ok", 0),
+                 "fail": (stats.get(e[0]) or {}).get("fail", 0),
+                 "last_ok": time.strftime("%Y-%m-%dT%H:%M:%S%z",
+                                          time.localtime(stats[e[0]]["last_ok"]))
+                 if (stats.get(e[0]) or {}).get("last_ok") else None}
+                for e in (dyn.get("mirrors") or []) if isinstance(e, (list, tuple))],
+        }
+        try:
+            with open(args.export, "w", encoding="utf-8") as f:
+                json.dump(doc, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+            print("\n已导出 → %s(可用作社区镜像数据源;引用前自行复验)"
+                  % os.path.abspath(args.export))
+        except OSError as e:
+            print("\n导出失败:%s" % e)
 
 
 def download_once(url, part_path, resume, min_speed=25.0, stall_s=12.0, proxy=None):
@@ -1515,7 +1652,11 @@ def cmd_dl(args):
                 return
             except Exception as e:
                 print("    失败:%s" % e)
+                if m and not m.startswith("PROXY:"):
+                    mirror_record_batch([(m, False, 0.0)])   # 连败入账,池子排序记得它
                 continue
+            if m and not m.startswith("PROXY:"):
+                mirror_record_batch([(m, True, got / max(secs, 1e-6))])
             os.replace(part, out)
             journal("dl", "%s | %s | %.2fMB/s"
                     % (name, label, got / max(secs, 1e-6) / 1e6))
@@ -1530,6 +1671,26 @@ def cmd_dl(args):
     journal("dl-fail", url)
     sys.exit("全部通道均失败;可稍后重试,或:① ghspeed mirrors 看镜像健康状况  "
              "② ghspeed proxy detect 找本地代理后 GHSPEED_PROXY=... ghspeed dl ...")
+
+
+def cmd_url(args):
+    """把 GitHub 链接展开成 直连 + 各镜像前缀 的等价下载链接(挑顺手的用)。"""
+    u = args.url.strip()
+    if "://" not in u:
+        m = _REPO_SH_RE.match(u)
+        if not m:
+            sys.exit("不认识的地址:给完整 GitHub 链接,或 owner/repo[@分支或tag]")
+        o, r, ref = m.groups()
+        u = "https://codeload.github.com/%s/%s/zip/%s" % (o, r, ref or "HEAD")
+    if not GITHUB_URL_RE.match(u):
+        sys.exit("只支持 GitHub 相关链接(github.com / *.githubusercontent.com / "
+                 "*.githubassets.com / *.github.io);其他网站本工具一概不处理")
+    pool = mirror_pool()
+    print("直连  %s" % u)
+    for e in pool:
+        print("  %-24s %s%s" % (urlparse(e).netloc, e, u))
+    print("\n池子全部真验证过(24h 缓存)。用法:curl -L <链接> -o 文件名,"
+          "或 ghspeed dl <原链接> 自动选最快通道")
 
 
 def cmd_git(args):
@@ -2797,8 +2958,16 @@ def main():
     sub.add_parser("off", help="停用:还原 hosts + 卸载定时任务(root)").set_defaults(func=cmd_off)
     sub.add_parser("status", help="查看当前状态与实测延迟").set_defaults(func=cmd_status)
     sub.add_parser("probe", help="只测速,不写 hosts").set_defaults(func=cmd_probe)
-    sub.add_parser("mirrors", help="检查各下载镜像的健康度").set_defaults(func=cmd_mirrors)
     sub.add_parser("install", help="把本脚本安装为 /usr/local/bin/ghspeed(root)").set_defaults(func=cmd_install)
+
+    p = sub.add_parser("mirrors", help="检查各下载镜像的健康度(带跨会话记忆评分)")
+    p.add_argument("--export", nargs="?", const="mirrors.json", metavar="FILE",
+                   help="把实测通过的镜像池导出为 JSON(默认 ./mirrors.json)")
+    p.set_defaults(func=cmd_mirrors)
+
+    p = sub.add_parser("url", help="把 GitHub 链接展开为直连+各镜像前缀的等价下载链接")
+    p.add_argument("url", help="GitHub 链接,或 owner/repo[@分支或tag] 整仓 zip")
+    p.set_defaults(func=cmd_url)
 
     p = sub.add_parser("refresh", help="重新测速并刷新(定时任务调用)")
     p.add_argument("-q", "--quiet", action="store_true")
