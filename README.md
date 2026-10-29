@@ -132,6 +132,8 @@ ghspeed sni test|on|off|state|git   浏览器 SNI 分片(可选):ClientHello 拆
                           也走分片 relay(只写 github.com 域级配置,off 原样还原)
 ghspeed live             看当前谁正连着钉选 IP(请求吃到加速的实时视图)
 ghspeed activity         回放 ghspeed 自身动作日志(下载通道/刷新/开关)
+ghspeed hosts-export [文件]  测速结果导出成 GitHub520 兼容 hosts 文件(SwitchHosts 可直接指向;
+                          默认 ~/.ghspeed/hosts,probe/refresh 自动刷新)
 ghspeed --version         版本号
 ```
 
@@ -153,7 +155,10 @@ ghspeed 按阶梯逐级兜底,`ghspeed status` 一次看清各级状态:
 
 1. **hosts 钉 IP** —— 主通道。测速选最快 IP 写 hosts,30 分钟自动刷新;
    候选 IP 除 DoH/内置网段外,还会拉**社区 hosts 源**(GitHub520/ineo6,6h 缓存),
-   但一律过 TLS+SNI 真实验证才可能被钉上
+   但一律过 TLS+SNI 真实验证才可能被钉上。想用 SwitchHosts 管理的话:
+   `ghspeed hosts-export` 输出 GitHub520 同款格式文件(probe/refresh 自动刷新),
+   SwitchHosts 指向它即可——IP 比社区源多一道证书验证闸(与 ghspeed 自身
+   钉选二选一,别同时开)
 2. **动态镜像池** —— 下载/clone 的备胎。发布站(ghproxy.link)+ 已知家族域名做候选,
    拿真实 release 资产逐个验证,**下单顺序按实测吞吐排(256KB 真下载实测,
    低延迟≠宽管道,下载快才算快;同吞吐再看延迟)**;
@@ -206,6 +211,7 @@ GHSPEED_MIRRORS="https://your-mirror.example.com/" ghspeed dl <url>
                │ 调用(同一份引擎)
 ┌─ CLI 引擎 ───▼──────────────────────────────┐
 │  ghspeed.py(纯标准库 Python 3,三平台通用) │
+│  + 可选插件 ghspeed_sni.py(SNI 分片,懒加载)│
 │  · DoH + 静态网段候选 IP                     │
 │  · 并发 TLS 握手测速(SNI 验证书)            │
 │  · 最快 IP → hosts 标记块                    │

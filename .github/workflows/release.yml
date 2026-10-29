@@ -40,9 +40,10 @@ jobs:
       - name: Build .deb
         run: |
           V=$(tr -d '[:space:]' < VERSION)
-          mkdir -p pkg/DEBIAN pkg/usr/bin
+          mkdir -p pkg/DEBIAN pkg/usr/bin pkg/usr/local/share/ghspeed
           sed "s/@VERSION@/$V/" packaging/deb/control > pkg/DEBIAN/control
           cp ghspeed.py pkg/usr/bin/ghspeed
+          cp ghspeed_sni.py pkg/usr/local/share/ghspeed/ghspeed_sni.py
           chmod 755 pkg/usr/bin/ghspeed
           dpkg-deb --build --root-owner-group pkg "ghspeed_${V}_all.deb"
           ls -lh *.deb
@@ -67,8 +68,8 @@ jobs:
           pip install pyinstaller pillow pystray
           python -c "from PIL import Image; im = Image.open('icons/icon_1024.png'); im.save('icons/icon.ico', sizes=[(16,16),(24,24),(32,32),(48,48),(64,64),(128,128),(256,256)])"
           Copy-Item ghspeed_gui.pyw gui_entry.py
-          pyinstaller --onefile --noconsole --name GHSpeed --icon icons/icon.ico --add-data "icons/icon_1024.png;icons" --hidden-import pystray._win32 gui_entry.py
-          pyinstaller --onefile --name ghspeed-cli --icon icons/icon.ico ghspeed.py
+          pyinstaller --onefile --noconsole --name GHSpeed --icon icons/icon.ico --add-data "icons/icon_1024.png;icons" --add-data "ghspeed_sni.py;." --hidden-import pystray._win32 gui_entry.py
+          pyinstaller --onefile --name ghspeed-cli --icon icons/icon.ico --add-data "ghspeed_sni.py;." ghspeed.py
 
       - name: 冒烟测试(GHSpeed.exe 必须真机启动出可见 GUI 窗口;CLI 可运行)
         shell: pwsh
@@ -102,7 +103,7 @@ jobs:
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DAppVersion=$v" packaging/windows/installer.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           New-Item -ItemType Directory -Path stage\GHSpeed | Out-Null
-          Copy-Item dist\GHSpeed.exe, dist\ghspeed-cli.exe, ghspeed.py, ghspeed_gui.pyw, ghspeed.bat, README.md stage\GHSpeed\
+          Copy-Item dist\GHSpeed.exe, dist\ghspeed-cli.exe, ghspeed.py, ghspeed_sni.py, ghspeed_gui.pyw, ghspeed.bat, README.md stage\GHSpeed\
           Compress-Archive -Path stage\GHSpeed -DestinationPath "GHSpeed-windows-${{ github.ref_name }}.zip"
           Get-ChildItem dist\*.exe, *.zip | Select-Object Name, Length
 
@@ -135,6 +136,15 @@ jobs:
           ## GHSpeed ${{ github.ref_name }}
 
           GitHub 专用加速工具:测速固定最快 IP 到 hosts + 镜像加速下载。只碰 GitHub,不碰其他网络。
+
+          ### v0.5.1 变更(架构瘦身 + 生态互通)
+          - **SNI 分片拆为可选插件** `ghspeed_sni.py`(按需懒加载,缺失时优雅降级),
+            引擎主文件从 3100+ 行瘦回 2300 行,核心测速/下载不再背着实验特性维护
+          - **GitHub520 兼容导出**:`ghspeed hosts-export` 把实测钉选写成 GitHub520
+            同款格式(probe/refresh 自动刷新默认文件 ~/.ghspeed/hosts),
+            SwitchHosts 新增「本地 hosts」方案指向它即可;全部 IP 过 TLS 验证,
+            比社区源多一道防污染闸
+          - 安装包同时携带插件文件,老版本升级无缝
 
           ### v0.5.0 变更(地基重整版)
           - **镜像池跨会话记忆评分**:每次验证/下载成败都入账(吞吐 EMA、累计成败、

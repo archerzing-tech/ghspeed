@@ -13,6 +13,8 @@ ROOT=dist/pkgroot
 rm -rf "$ROOT"
 mkdir -p "$ROOT/usr/local/bin" "$ROOT/usr/local/share/ghspeed"
 install -m 755 ghspeed.py "$ROOT/usr/local/bin/ghspeed"
+mkdir -p "$ROOT/usr/local/share/ghspeed"
+install -m 644 ghspeed_sni.py "$ROOT/usr/local/share/ghspeed/ghspeed_sni.py"
 # .app bundle 不能直接作为 payload:部分系统(实测 OCLP Sonoma)的 installer
 # 会静默丢弃 bundle 载荷,普通文件则正常落地 —— 故打成 tar.gz 文件随包,
 # 由 postinstall 解包到 /Applications
@@ -28,7 +30,8 @@ cat > dist/scripts/postinstall <<'EOF'
 if [ -f "/usr/local/share/ghspeed/GHSpeed.app.tgz" ]; then
     rm -rf "/Applications/GHSpeed.app"
     tar -C /Applications -xzf "/usr/local/share/ghspeed/GHSpeed.app.tgz"
-    rm -rf "/usr/local/share/ghspeed"
+    rm -f "/usr/local/share/ghspeed/GHSpeed.app.tgz"
+    rmdir "/usr/local/share/ghspeed" 2>/dev/null || true   # 目录里还有 SNI 插件就留着
 fi
 uid=$(/usr/bin/stat -f %u /dev/console)
 user=$(/usr/bin/stat -f %Su /dev/console)

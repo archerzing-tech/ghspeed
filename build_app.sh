@@ -30,6 +30,7 @@ EOF
 
 swiftc -O menubar.swift -o "$APP/Contents/MacOS/GHSpeed"
 cp ghspeed.py "$APP/Contents/Resources/"
+cp ghspeed_sni.py "$APP/Contents/Resources/"   # 可选插件:SNI 分片(引擎按需懒加载)
 
 # 应用图标:有缓存直接用,否则现场绘制(需要 swiftc,本来就有)
 if [ ! -f AppIcon.icns ]; then
