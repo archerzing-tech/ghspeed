@@ -201,6 +201,28 @@ func appendProbeJournal(_ detail: String) {
     }
 }
 
+// ---------------- 菜单 UI 缓存:冷启动即有内容,不等后台探测 ----------------
+
+let UI_CACHE_FILE = NSHomeDirectory() + "/.ghspeed/menubar-ui.json"
+
+func loadUiCache() -> [String: Any] {
+    return (NSDictionary(contentsOfFile: UI_CACHE_FILE) as? [String: Any]) ?? [:]
+}
+
+func saveUiCache(_ key: String, _ value: Any) {
+    var d = loadUiCache()
+    d[key] = value
+    let dir = NSHomeDirectory() + "/.ghspeed"
+    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    _ = NSDictionary(dictionary: d).write(toFile: UI_CACHE_FILE, atomically: true)
+}
+
+func hhmm(_ ts: Double) -> String {
+    let df = DateFormatter()
+    df.dateFormat = "HH:mm"
+    return df.string(from: Date(timeIntervalSince1970: ts))
+}
+
 // 实测 GitHub 延迟:github.com → api → codeload 逐个试(都是钉选域;
 // raw/gist 本网永久 SNI 阻断,不探)。谁通算谁——github.com 单域被掐
 // ≠ 整站不可用,别动不动喊"链路波动"。全都不通才返回 nil
@@ -251,6 +273,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var liveItem: NSMenuItem!
     var recentItem: NSMenuItem!
     var liveCount = 0
+    var lastLiveAt = Date.distantPast   // ⚡ 图标粘滞:30 秒内见过连接就算活跃,不闪
+    var busyItem: NSMenuItem?           // 正在跑的动作对应的菜单项(置灰防连点)
+    var busyItemTitle = ""
+    var probing = false                 // 延迟探测单飞:上一轮没回来不再发新一轮
+    var lastProbeAt = Date.distantPast
+    var lastDnsCheck = Date.distantPast
+    var lastSniCheck = Date.distantPast
+    var allDownStreak = 0               // 整段不通的连续轮数(≥2 才认,防单次超时误报)
+    var healEpisodeNotified = false     // 一段坏窗口「已自动重测」只通知一次
 
     func applicationDidFinishLaunching(_ n: Notification) {
         item.button?.title = "🐙"
@@ -281,6 +312,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         addItem("退出", #selector(quit))
         actionItems = [toggleItem, refreshItem, mirrorsItem, downloadItem, autostartItem, dnsItem, sniItem]
 
+        primeFromCache()   // 冷启动先摆上次的结论,菜单第一下打开就有内容
         refreshUI()
         armTimer(120)
         // 活动轮询:谁的连接正吃着钉选 IP + 最近一条自身动作,5 秒一拍
@@ -291,6 +323,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 DispatchQueue.main.async {
                     guard let self = self else { return }
                     self.liveCount = r.total
+                    if r.total > 0 { self.lastLiveAt = Date() }
                     if r.total > 0 {
                         self.liveItem.title = "⚡ GitHub 活动:\(r.total) 条连接 ← "
                             + r.names.joined(separator: " ")
@@ -298,9 +331,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         self.liveItem.title = "GitHub 活动:当前无连接(访问 GitHub 时自动命中钉选)"
                     }
                     self.recentItem.title = latest.map { "最近:\($0)" } ?? ""
-                    if !self.downloading {
-                        self.item.button?.title = self.liveCount > 0 ? "🐙⚡" : "🐙"
-                    }
+                    if !self.downloading { self.updateIcon() }
                 }
             }
         }
@@ -309,20 +340,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // 不写 hosts、绝不弹密码)。之后点开启/刷新大多走种子轮,几秒收工;
         // 若已开启且配了免密授权,顺手静默应用一轮,没配就到此为止。
         DispatchQueue.global().async { [weak self] in
-            _ = runShell(engineUserCmd(["sni", "heal"]), timeout: 120)   // 启动自愈:孤儿 PAC 清扫 / relay 复活
+            // 顺序讲究:probe 最优先 —— 种子缓存热了,点「开启加速」才能几秒收工;
+            // sni heal 只是孤儿清扫,排最后,不挡正事
             _ = runShell(engineUserCmd(["probe"]), timeout: 300)
             _ = runShell(engineUserCmd(["mirrors"]), timeout: 300)   // 启动预热:镜像池过期就重验,首次下载零冷启动(后台,不弹窗)
+            _ = runShell(engineUserCmd(["sni", "heal"]), timeout: 120)   // 启动自愈:孤儿 PAC 清扫 / relay 复活
             DispatchQueue.main.async {
-                self?.refreshUI()
+                self?.refreshUI(true)
                 guard let self = self else { return }
                 let (on, _) = hostsOn()
-                if on, FileManager.default.fileExists(atPath: ENGINE_BIN) {
+                if on, FileManager.default.fileExists(atPath: ENGINE_BIN), !self.busy {
                     let r = runShell(["/usr/bin/sudo", "-n", ENGINE_BIN, "refresh", "-q"],
                                      timeout: 300)
                     if r.code == 0 {
                         notify("GitHub 加速", "启动测速完成,已自动应用最优 IP")
                     }
-                    self.refreshUI()
+                    self.refreshUI(true)
                 }
             }
         }
@@ -336,62 +369,137 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuNeedsUpdate(_ m: NSMenu) { refreshUI() }
 
-    func refreshUI() {
+    // 只在主线程调用(所有调用点都在主线程)。原则:已有的结论先摆着,探测只做增量更新,
+    // 绝不把界面打回「检测中…」干等 —— 菜单开合要即时有内容。
+    func refreshUI(_ force: Bool = false) {
         let (on, count) = hostsOn()
-        DispatchQueue.main.async {
-            self.statusLine.title = on
+        if !busy {   // 动作进行中,状态行让位给「⏳ 正在…」提示
+            statusLine.title = on
                 ? "🚀 加速已开启(固定 \(count) 个域名)"
                 : "🐙 加速未开启"
-            self.toggleItem.title = on ? "关闭加速" : "开启加速"
-            self.latencyLine.title = "github.com:检测中…"
-            if !self.downloading {
-                self.item.button?.title = self.liveCount > 0 ? "🐙⚡" : "🐙"
-            }
-            self.autostartItem.state = self.autostartInstalled() ? .on : .off
         }
-        DispatchQueue.global().async {          // DNS 态要跑 networksetup,放后台查
-            let dnsIsOn = dnsOn()
-            DispatchQueue.main.async {
-                self.dnsItem.state = dnsIsOn ? .on : .off
-                self.dnsItem.title = dnsIsOn ? "系统 DNS 还原(取消接管)"
-                                             : "系统 DNS 接管(可选)"
+        if busyItem !== toggleItem {
+            toggleItem.title = on ? "关闭加速" : "开启加速"
+        }
+        if !downloading { updateIcon() }
+        autostartItem.state = autostartInstalled() ? .on : .off
+
+        let now = Date()
+        // DNS / SNI 态有 5 分钟缓存:菜单反复开合不再反复跑 networksetup / 引擎子进程
+        if now.timeIntervalSince(lastDnsCheck) > 300 {
+            lastDnsCheck = now
+            DispatchQueue.global().async { [weak self] in
+                let dnsIsOn = dnsOn()   // 要跑 networksetup,放后台
+                DispatchQueue.main.async {
+                    guard let self = self, self.busyItem !== self.dnsItem else { return }
+                    self.dnsItem.state = dnsIsOn ? .on : .off
+                    self.dnsItem.title = dnsIsOn ? "系统 DNS 还原(取消接管)"
+                                                 : "系统 DNS 接管(可选)"
+                    saveUiCache("dns_on", dnsIsOn)
+                }
             }
         }
-        DispatchQueue.global().async {          // SNI 态要查系统 PAC + relay 端口,放后台
-            let sniIsOn = self.sniOn()
-            DispatchQueue.main.async {
-                self.sniItem.state = sniIsOn ? .on : .off
-                self.sniItem.title = sniIsOn ? "浏览器 SNI 还原(取消分片)"
-                                             : "浏览器 SNI 分片(可选)"
+        if now.timeIntervalSince(lastSniCheck) > 300 {
+            lastSniCheck = now
+            DispatchQueue.global().async { [weak self] in
+                let sniIsOn = self?.sniOn() ?? false   // 要查系统 PAC + relay 端口,放后台
+                DispatchQueue.main.async {
+                    guard let self = self, self.busyItem !== self.sniItem else { return }
+                    self.sniItem.state = sniIsOn ? .on : .off
+                    self.sniItem.title = sniIsOn ? "浏览器 SNI 还原(取消分片)"
+                                                 : "浏览器 SNI 分片(可选)"
+                    saveUiCache("sni_on", sniIsOn)
+                }
             }
         }
-        DispatchQueue.global().async {
+        // 延迟探测:25 秒内测过直接复用旧值(连开菜单/连点不再刷屏式探测),且探测单飞
+        guard !probing else { return }
+        guard force || now.timeIntervalSince(lastProbeAt) > 25 else { return }
+        probing = true
+        lastProbeAt = now
+        DispatchQueue.global().async { [weak self] in
             let r = measureLatency()
             DispatchQueue.main.async {
-                if let r = r {
-                    if r.via == "github.com" {
-                        self.latencyLine.title = "github.com:\(r.ms) ms"
-                        self.githubDownStreak = 0
-                    } else {
-                        // github.com 被掐但别的域活着:照实说,别吓人
-                        self.latencyLine.title = "github.com 波动中(\(r.via) \(r.ms) ms 可用)"
-                        self.githubDownStreak += 1
-                    }
-                    self.lastAllDown = false
-                } else if hostsOn().on {
-                    // 已开启还整段不通 = 坏窗口(TLS 全被丢),不是没加速
-                    self.latencyLine.title = "github.com:链路波动中(通常几分钟内自动恢复)"
-                    self.lastAllDown = true
-                    self.githubDownStreak += 1
-                } else {
-                    self.latencyLine.title = "github.com:当前直连不通(建议开启加速)"
-                    self.lastAllDown = false
-                }
-                self.logProbeTransition(allDown: self.lastAllDown)   // 波动时间线(只记翻转)
-                self.autoHealIfNeeded()
-                self.armTimer(self.lastAllDown ? 30 : 120)   // 坏窗口期 30 秒一测,快点走出去
+                guard let self = self else { return }
+                self.probing = false
+                self.absorbLatency(r)
             }
         }
+    }
+
+    // 冷启动先用 ~/.ghspeed/menubar-ui.json 里的上次结论把菜单填上,后台探测慢慢刷新 ——
+    // 打开应用第一下就有可看可点的状态
+    func primeFromCache() {
+        let c = loadUiCache()
+        let (on, count) = hostsOn()
+        statusLine.title = on ? "🚀 加速已开启(固定 \(count) 个域名)" : "🐙 加速未开启"
+        toggleItem.title = on ? "关闭加速" : "开启加速"
+        if let ms = c["latency_ms"] as? Int, let via = c["latency_via"] as? String,
+           let ts = c["latency_ts"] as? Double, ms >= 0 {
+            let ageH = (Date().timeIntervalSince1970 - ts) / 3600
+            let stamp = ageH < 24 ? (ageH > 10.0 / 60 ? "(\(hhmm(ts)) 测)" : "") : ""
+            latencyLine.title = via == "github.com"
+                ? "github.com:\(ms) ms\(stamp)"
+                : "github.com 波动中(\(via) \(ms) ms 可用)\(stamp)"
+            lastProbeAt = Date(timeIntervalSince1970: ts)
+        } else {
+            latencyLine.title = "github.com:检测中…"
+        }
+        if let b = c["dns_on"] as? Bool {
+            dnsItem.state = b ? .on : .off
+            dnsItem.title = b ? "系统 DNS 还原(取消接管)" : "系统 DNS 接管(可选)"
+            lastDnsCheck = Date()
+        }
+        if let b = c["sni_on"] as? Bool {
+            sniItem.state = b ? .on : .off
+            sniItem.title = b ? "浏览器 SNI 还原(取消分片)" : "浏览器 SNI 分片(可选)"
+            lastSniCheck = Date()
+        }
+    }
+
+    // 图标 ⚡ 粘滞 30 秒:连接来了又走,图标不再每 5 秒闪来闪去
+    func updateIcon() {
+        let live = Date().timeIntervalSince(lastLiveAt) < 30
+        item.button?.title = live ? "🐙⚡" : "🐙"
+    }
+
+    // 探测结果落地。防抖原则:单轮异常不改口(可能是单次超时),连续两轮异常才承认「波动」,
+    // 状态行不再在 ms 和「波动中」之间反复横跳
+    func absorbLatency(_ r: (ms: Int, via: String)?) {
+        if let r = r {
+            saveUiCache("latency_ms", r.ms)
+            saveUiCache("latency_via", r.via)
+            saveUiCache("latency_ts", Date().timeIntervalSince1970)
+            if r.via == "github.com" {
+                githubDownStreak = 0
+                allDownStreak = 0
+                lastAllDown = false
+                healEpisodeNotified = false   // 好窗口回来了,下一段坏窗口重新允许报一次
+                latencyLine.title = "github.com:\(r.ms) ms"
+            } else {
+                // github.com 被掐但别的域活着;首轮先不动状态行,连续两轮才说「波动」
+                githubDownStreak += 1
+                lastAllDown = false
+                if githubDownStreak >= 2 {
+                    latencyLine.title = "github.com 波动中(\(r.via) \(r.ms) ms 可用)"
+                }
+            }
+        } else if hostsOn().on {
+            // 已开启还整段不通 = 坏窗口(TLS 全被丢),不是没加速;连续两轮才认
+            allDownStreak += 1
+            githubDownStreak += 1
+            if allDownStreak >= 2 {
+                lastAllDown = true
+                latencyLine.title = "github.com:链路波动中(通常几分钟内自动恢复)"
+            }
+        } else {
+            allDownStreak = 0
+            lastAllDown = false
+            latencyLine.title = "github.com:当前直连不通(建议开启加速)"
+        }
+        logProbeTransition(allDown: lastAllDown)   // 波动时间线(只记翻转)
+        autoHealIfNeeded()
+        armTimer(lastAllDown ? 30 : 120)   // 坏窗口期 30 秒一测,快点走出去
     }
 
     // 波动时间线:只在 翻转/恢复 边界记一笔 probe 行(activity.log,ghspeed activity 可回放)
@@ -418,18 +526,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // 整段不通、或 github.com 连续两轮被掐(其余域还活着)→ 免密重测钉新 IP
     // (2 分钟最多一次;refresh -q 全量重测,当前能过 TLS 握手的候选才会被钉上)
     func autoHealIfNeeded() {
-        guard Date().timeIntervalSince(lastHeal) > 120,
+        guard !busy,   // 用户动作/上一轮自愈还在跑就先不叠加(防两个引擎并发写 hosts)
+              Date().timeIntervalSince(lastHeal) > 120,
               lastAllDown || githubDownStreak >= 2,
               FileManager.default.fileExists(atPath: ENGINE_BIN) else { return }
         lastHeal = Date()
+        beginAction(refreshItem, "⏳ 自动重测中…")
         DispatchQueue.global().async { [weak self] in
             let r = runShell(["/usr/bin/sudo", "-n", ENGINE_BIN, "refresh", "-q"],
                              timeout: 300)
-            if r.code == 0 {
-                notify("GitHub 加速", "检测到链路波动,已自动重测并更新最优 IP")
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.endAction()
+                // 一段坏窗口只报一次,别每 2 分钟弹一条「检测到波动」
+                if r.code == 0 && !self.healEpisodeNotified {
+                    notify("GitHub 加速", "检测到链路波动,已自动重测并更新最优 IP")
+                    self.healEpisodeNotified = true
+                }
+                self.suggestSsh443IfNeeded()
+                self.refreshUI(true)
             }
-            self?.suggestSsh443IfNeeded()
-            DispatchQueue.main.async { self?.refreshUI() }
         }
     }
 
@@ -452,14 +568,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func setBusy(_ b: Bool) {
-        // busy 只拦逻辑,不灰菜单项:永远可点,点了给通知(用户反馈:全灰像死了)
         busy = b
         if b { busyT0 = Date() }
     }
 
+    // 动作开始:正在跑的那一项置灰 + 标 ⏳(看得见在忙,也点不出第二次);
+    // 其余菜单项照常可点(全灰像死了),点了会收到「还在跑」提醒
+    func beginAction(_ item: NSMenuItem?, _ title: String) {
+        setBusy(true)
+        busyItem = item
+        busyItemTitle = item?.title ?? ""
+        item?.isEnabled = false
+        item?.title = title
+    }
+
+    func endAction() {
+        setBusy(false)
+        busyItem?.isEnabled = true
+        busyItem?.title = busyItemTitle
+        busyItem = nil
+    }
+
     func noteBusy() {
         let secs = busyT0.map { Int(Date().timeIntervalSince($0)) } ?? 0
-        notify("GitHub 加速", "⏳ 上一项还在跑(\(secs) 秒),完成前先别切")
+        let what = busyItemTitle.replacingOccurrences(of: "⏳ ", with: "")
+        notify("GitHub 加速", "⏳ \(what)还在跑(\(secs) 秒),完成前先别切")
     }
 
     // ---- 动作 ----
@@ -468,37 +601,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if busy { noteBusy(); return }
         let (on, _) = hostsOn()
         let act = on ? "off" : "on"
-        setBusy(true)
+        beginAction(toggleItem, act == "on" ? "⏳ 正在开启…" : "⏳ 正在关闭…")
         statusLine.title = act == "on" ? "⏳ 正在开启(通常几秒,网络差时约 1 分钟)…" : "⏳ 正在关闭…"
         adminEngine([act]) { ok, out in
-            self.setBusy(false)
+            self.endAction()
             if ok {
                 notify("GitHub 加速", act == "on" ? "已开启 ✅" : "已关闭,已还原 /etc/hosts")
             } else {
                 notify("GitHub 加速", "操作失败:\(out.suffix(120))")
             }
-            self.refreshUI()
+            self.refreshUI(true)
         }
     }
 
     @objc func refreshNow(_ s: Any) {
         if busy { noteBusy(); return }
-        setBusy(true)
+        beginAction(refreshItem, "⏳ 正在测速…")
         statusLine.title = "⏳ 正在测速(通常几秒)…"
         adminEngine(["refresh"]) { ok, out in
-            self.setBusy(false)
+            self.endAction()
             notify("GitHub 加速", ok ? "测速完成,已更新最优 IP ✅" : "测速失败:\(out.suffix(120))")
-            self.refreshUI()
+            self.refreshUI(true)
         }
     }
 
     @objc func checkMirrors(_ s: Any) {
         if busy { noteBusy(); return }
-        setBusy(true)
+        beginAction(mirrorsItem, "⏳ 镜像检测中…")
         DispatchQueue.global().async {
             let r = runEngineMirrors()
             DispatchQueue.main.async {
-                self.setBusy(false)
+                self.endAction()
                 showTextDialog(r.out.isEmpty ? "(无输出)" : String(r.out.suffix(1500)),
                                title: "GitHub 镜像健康检查")
             }
@@ -507,6 +640,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func downloadClip(_ s: Any) {
         if downloading { notify("GitHub 加速", "已有下载在进行中"); return }
+        if busy { noteBusy(); return }   // 别和 on/off/refresh 并发:一个引擎一个 hosts,叠着跑会互相踩
         let clip = NSPasteboard.general.string(forType: .string)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard clip.hasPrefix("http"), clip.lowercased().contains("github") else {
@@ -516,7 +650,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let name = clip.split(separator: "?")[0].split(separator: "/").last.map(String.init) ?? "download.bin"
         let outPath = NSHomeDirectory() + "/Downloads/" + name
         downloading = true
-        setBusy(true)
+        beginAction(downloadItem, "⬇️ 下载中…")
         item.button?.title = "⬇️ …"
         DispatchQueue.global().async {
             let argv = engineUserCmd(["dl", clip, "-o", outPath])
@@ -558,10 +692,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func downloadDone(ok: Bool, msg: String) {
         downloading = false
-        setBusy(false)
+        endAction()
         notify("GitHub 加速", ok ? "下载完成 → Downloads/\(msg)"
                                 : "下载失败(镜像与直连均已尝试,详见 ghspeed mirrors)")
-        refreshUI()
+        refreshUI(true)
     }
 
     // ---- 开机自启(用户级 LaunchAgent,不需要管理员)----
@@ -613,14 +747,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             alert.addButton(withTitle: "取消")
             if alert.runModal() != .alertFirstButtonReturn { return }
         }
-        setBusy(true)
+        beginAction(dnsItem, on ? "⏳ 正在还原系统 DNS…" : "⏳ 正在接管系统 DNS…")
         statusLine.title = on ? "⏳ 正在还原系统 DNS…" : "⏳ 正在接管系统 DNS…"
         adminEngine(["dns", on ? "off" : "on"]) { ok, out in
-            self.setBusy(false)
+            self.endAction()
+            self.lastDnsCheck = .distantPast   // 下次打开菜单重查真实态
             notify("GitHub 加速", ok
                 ? (on ? "已还原系统 DNS" : "已接管系统 DNS(阿里/腾讯,备份可随时还原)✅")
                 : "DNS 操作失败:\(out.suffix(120))")
-            self.refreshUI()
+            self.refreshUI(true)
         }
     }
 
@@ -634,16 +769,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func toggleSNI(_ s: Any) {
         if busy { noteBusy(); return }
         let on = sniOn()
-        setBusy(true)
+        beginAction(sniItem, on ? "⏳ 正在还原 SNI 分片…"
+                                : "⏳ 正在开启 SNI 分片(首次先实测各策略,约半分钟)…")
         statusLine.title = on ? "⏳ 正在还原 SNI 分片…"
                               : "⏳ 正在开启 SNI 分片(首次先实测各策略,约半分钟)…"
         adminEngine(["sni", on ? "off" : "on"]) { ok, out in
-            self.setBusy(false)
+            self.endAction()
+            self.lastSniCheck = .distantPast   // 下次打开菜单重查真实态
             notify("GitHub 加速", ok
                 ? (on ? "已还原 SNI 分片设置"
                       : "SNI 分片已开启(仅 GitHub 域走本地 relay,其余直连)✅")
                 : "SNI 操作失败:\(out.suffix(120))")
-            self.refreshUI()
+            self.refreshUI(true)
         }
     }
 

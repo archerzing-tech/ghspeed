@@ -65,9 +65,17 @@ class App:
 
         self.busy = False
         self._job = 0
+        self._busy_btn = None          # 正在跑的动作对应按钮(置灰防连点)
+        self._worker = None            # 后台工作线程(超时后可能还活着,防叠加)
+        self._lat = None               # (ms, via, ts) 最近一次延迟结论,打开即显示
+        self._lat_running = False      # 延迟探测单飞:上一轮没回来不再发新一轮
+        self._lat_probe_at = 0.0       # 上次探测时刻(25 秒内复用,不刷屏式探测)
+        self._bad_streak = 0           # 连续异常轮数(≥2 才喊波动,防单次超时误报)
         self._exit_after_done = "--elevated-off" in sys.argv
         self.tray = None            # 托盘图标(pystray),main() 里装配
+        self._prime_from_state()
         self.refresh_ui()
+        self.root.after(300_000, self._auto_probe_loop)   # 5 分钟一拍链路快查
         threading.Thread(target=self._sni_boot, daemon=True).start()
         if "--elevated-on" in sys.argv:  # UAC 提权重启后自动开启
             self.root.after(300, self.toggle)
@@ -84,7 +92,26 @@ class App:
         except Exception:
             return {}
 
-    def refresh_ui(self):
+    def _prime_from_state(self):
+        """冷启动先拿上次测速结论摆上,不等后台探测(与 macOS 菜单栏同一思路)"""
+        try:
+            st = eng.load_state() or {}
+            m = (st.get("map") or {}).get("github.com")
+            if m and m.get("rtt_ms", -1) >= 0:
+                ts = float(st.get("time") or 0)
+                self._lat = (int(m["rtt_ms"]), "github.com", ts)
+                self._lat_probe_at = ts
+        except Exception:
+            pass
+
+    @staticmethod
+    def _lat_text(ms, via):
+        if ms < 0:
+            return ""
+        return "github.com:%d ms" % ms if via == "github.com" \
+            else "github.com 波动中(%s %d ms 可用)" % (via, ms)
+
+    def refresh_ui(self, force=False):
         m = self.hosts_on()
         on = bool(m)
         self.status.config(text=("🚀 加速已开启(固定 %d 个域名)" % len(m)) if on
@@ -92,8 +119,33 @@ class App:
                            fg=("#1a7f37" if on else "#999999"))
         self.toggle_btn.config(text="关闭加速" if on else "开启加速")
         self.dns_btn.config(text="DNS 还原" if self.dns_on() else "DNS 接管")
-        self.latency.config(text="github.com:检测中…")
+        # 已有结论先摆着,探测只做增量更新,绝不打回「检测中…」干等
+        if self._lat:
+            ms, via, ts = self._lat
+            stamp = "" if time.time() - ts <= 600 \
+                else " (%s 测)" % time.strftime("%H:%M", time.localtime(ts))
+            self.latency.config(text=self._lat_text(ms, via) + stamp)
+        else:
+            self.latency.config(text="github.com:检测中…")
+        now = time.time()
+        if self._lat_running:          # 探测单飞
+            return
+        if not force and now - self._lat_probe_at < 25:
+            return                     # 刚测过,复用旧值,不刷屏式探测
+        self._lat_probe_at = now
+        self._lat_running = True
         threading.Thread(target=self._latency_worker, daemon=True).start()
+
+    def _auto_probe_loop(self):
+        """周期链路快查(与引擎 watch 同口径):坏窗口在界面上看得见,不再
+        「不点按钮就永远停在旧状态」。自愈交给 SYSTEM 定时任务(watch 档,
+        引擎自动迁移),界面侧不弹 UAC。"""
+        try:
+            if not self.busy:
+                self.refresh_ui()
+        except Exception:
+            pass   # 周期任务绝不能把界面带崩
+        self.root.after(300_000, self._auto_probe_loop)
 
     def _latency_worker(self):
         ms, via = self._measure()
@@ -108,11 +160,26 @@ class App:
         self.root.after(0, lambda: self._lat_done(ms, via, dns_real, sni_real))
 
     def _lat_done(self, ms, via, dns_real, sni_real=False):
-        if ms >= 0:   # 与 macOS 菜单栏同一套少喊狼逻辑:单域被掐 ≠ 整站不可用
-            self.latency.config(
-                text="github.com:%d ms" % ms if via == "github.com"
-                else "github.com 波动中(%s %d ms 可用)" % (via, ms))
+        self._lat_running = False
+        # 防抖:单轮异常不改口(可能是单次超时),连续两轮异常才承认「波动」,
+        # 状态行不再在 ms 和「波动中」之间反复横跳
+        if ms >= 0 and via == "github.com":
+            self._bad_streak = 0
+            self._lat = (ms, via, time.time())
+            self.latency.config(text=self._lat_text(ms, via))
+        elif ms >= 0:
+            # github.com 被掐但别的域活着;首轮先不动,连续两轮才说「波动」
+            self._bad_streak += 1
+            if self._bad_streak >= 2:
+                self._lat = (ms, via, time.time())
+                self.latency.config(text=self._lat_text(ms, via))
+        elif self.hosts_on():
+            # 已开启还整段不通 = 坏窗口(TLS 全被丢),不是没加速;连续两轮才认
+            self._bad_streak += 1
+            if self._bad_streak >= 2:
+                self.latency.config(text="github.com:链路波动中(通常几分钟内自动恢复)")
         else:
+            self._bad_streak = 0
             self.latency.config(text="github.com:当前直连不通(建议开启加速)")
         self.dns_btn.config(text="DNS 还原" if dns_real else "DNS 接管")
         self.sni_btn.config(text="SNI 还原" if sni_real else "SNI 分片")
@@ -130,11 +197,33 @@ class App:
                 continue
         return -1, ""
 
-    def set_busy(self, b):
-        # busy 只拦逻辑,不再灰按钮:界面永远可点,点了给提示(用户反馈:全灰像死了)
+    def set_busy(self, b, btn=None):
+        # busy 只拦逻辑;只灰正在跑的那一个按钮(看得见在忙,也点不出第二次),
+        # 其余照常可点(全灰像死了),点了给提示
         self.busy = b
         if b:
             self._busy_t0 = time.time()
+            self._busy_btn = btn
+            if btn is not None:
+                btn.config(state="disabled")
+        else:
+            if self._busy_btn is not None:
+                try:
+                    self._busy_btn.config(state="normal")
+                except tk.TclError:
+                    pass   # 窗口正在销毁等场景,别让恢复按钮挡了收尾
+                self._busy_btn = None
+
+    def _worker_alive(self):
+        t = self._worker
+        return t is not None and t.is_alive()
+
+    def busy_gate(self):
+        """True = 有动作在跑(含超时后仍在收尾的线程),拦下这次点击"""
+        if self.busy or self._worker_alive():
+            self.note_busy()
+            return True
+        return False
 
     def note_busy(self):
         t0 = getattr(self, "_busy_t0", None)
@@ -144,21 +233,21 @@ class App:
     # ---------------- 动作 ----------------
 
     def toggle(self):
-        if self.busy:
-            self.note_busy()
+        if self.busy_gate():
             return
         if self.hosts_on():
             if not eng.is_admin():   # 改 hosts 要管理员:提权后再关,别让用户干瞪眼
                 self.elevate("--elevated-off")
                 return
             self.run_bg("正在关闭…", self._do_off, "已关闭,已还原 hosts", "关闭失败",
-                        timeout=30)
+                        timeout=30, btn=self.toggle_btn)
             return
         if not eng.is_admin():
             self.elevate("--elevated-on")
             return
         self.run_bg("正在测速并开启(通常几秒,网络差时约 1 分钟)…",
-                    self._do_on, "已开启 ✅", "开启失败", timeout=180)
+                    self._do_on, "已开启 ✅", "开启失败", timeout=180,
+                    btn=self.toggle_btn)
 
     def elevate(self, flag):
         """弹 UAC 重启自己;flag 让提权后的实例接着把事情做完"""
@@ -218,17 +307,15 @@ class App:
             eng.write_hosts(state)
 
     def refresh_now(self):
-        if self.busy:
-            self.note_busy()
+        if self.busy_gate():
             return
         ok = ("测速完成,已更新最优 IP ✅" if eng.is_admin() else
               "测速完成(未提权,仅更新缓存;固定 hosts 请点「开启加速」)")
         self.run_bg("正在测速(通常几秒)…", self._do_refresh, ok, "测速失败",
-                    timeout=180)
+                    timeout=180, btn=self.refresh_btn)
 
     def check_mirrors(self):
-        if self.busy:
-            self.note_busy()
+        if self.busy_gate():
             return
         self.set_busy(True)
         self.status.config(text="⏳ 正在检测镜像…", fg="#b58900")
@@ -243,7 +330,8 @@ class App:
             text = buf.getvalue()
             self.root.after(0, lambda: self.show_out(text))
 
-        threading.Thread(target=work, daemon=True).start()
+        self._worker = threading.Thread(target=work, daemon=True)
+        self._worker.start()
 
     # ---------------- DNS(opt-in 全局接管,原配置自动备份可还原) ----------------
 
@@ -255,14 +343,13 @@ class App:
             return False
 
     def toggle_dns(self):
-        if self.busy:
-            self.note_busy()
+        if self.busy_gate():
             return
         turning_on = not self.dns_on()   # 点按钮即切换,不弹确认窗;再点一次原样还原
         if not eng.is_admin():
             self.elevate("--elevated-dns")
             return
-        self.set_busy(True)
+        self.set_busy(True, self.dns_btn)
         self._tick_start("正在%s系统 DNS…" % ("接管" if turning_on else "还原"))
 
         def work():
@@ -277,7 +364,8 @@ class App:
                 ok, msg = False, "DNS 操作失败:%s" % e
             self.root.after(0, lambda: self.done(ok, msg))
 
-        threading.Thread(target=work, daemon=True).start()
+        self._worker = threading.Thread(target=work, daemon=True)
+        self._worker.start()
 
     # ---------------- SNI 分片(浏览器 GitHub 直连的识别型阻断;opt-in) ----------------
 
@@ -296,14 +384,13 @@ class App:
             pass
 
     def toggle_sni(self):
-        if self.busy:
-            self.note_busy()
+        if self.busy_gate():
             return
         try:
             turning_on = not eng.sni_state()["enabled"]   # 点按钮即切换,不弹确认窗
         except Exception:
             turning_on = True
-        self.set_busy(True)
+        self.set_busy(True, self.sni_btn)
         self._tick_start(
             "正在%s浏览器 SNI 分片%s…"
             % ("开启" if turning_on else "还原",
@@ -333,16 +420,16 @@ class App:
                 ok, msg = False, "SNI 操作失败:%s" % e
             self.root.after(0, lambda: self.done(ok, msg))
 
-        threading.Thread(target=work, daemon=True).start()
+        self._worker = threading.Thread(target=work, daemon=True)
+        self._worker.start()
 
     # ---------------- 活动可视化(并入诊断;详见 ghspeed live) ----------------
 
     def run_diag(self):
         """多级通道自检:hosts/镜像池/ssh443/本地代理/DNS/SNI/活动连接 一次看清"""
-        if self.busy:
-            self.note_busy()
+        if self.busy_gate():
             return
-        self.set_busy(True)
+        self.set_busy(True, self.diag_btn)
         self.status.config(text="⏳ 正在自检多级通道…", fg="#b58900")
 
         def work():
@@ -355,11 +442,12 @@ class App:
             text = buf.getvalue()
             self.root.after(0, lambda: self.show_out(text))
 
-        threading.Thread(target=work, daemon=True).start()
+        self._worker = threading.Thread(target=work, daemon=True)
+        self._worker.start()
 
     def show_out(self, text):
         self.set_busy(False)
-        self.refresh_ui()
+        self.refresh_ui(True)
         self.out.config(state="normal")
         self.out.delete("1.0", "end")
         self.out.insert("1.0", text or "(无输出)")
@@ -390,8 +478,8 @@ class App:
         self.root.after(1000, tick)
         return job
 
-    def run_bg(self, msg, fn, ok_msg, err_prefix, timeout=None):
-        self.set_busy(True)
+    def run_bg(self, msg, fn, ok_msg, err_prefix, timeout=None, btn=None):
+        self.set_busy(True, btn)
         job = self._tick_start(msg)
 
         def post(ok, text):
@@ -413,7 +501,8 @@ class App:
             else:
                 post(True, ok_msg)
 
-        threading.Thread(target=work, daemon=True).start()
+        self._worker = threading.Thread(target=work, daemon=True)
+        self._worker.start()
 
         if timeout:
             def watchdog():
@@ -427,7 +516,7 @@ class App:
 
     def done(self, ok, msg):
         self.set_busy(False)
-        self.refresh_ui()
+        self.refresh_ui(True)
         if ok:   # 成功不弹窗打扰,结果写在状态行;失败才弹
             self.status.config(text="✅ " + msg, fg="#1a7f37")
             if self._exit_after_done:   # 提权只是为了关加速:干完就退

@@ -105,9 +105,9 @@ REFRESH_INTERVAL = 1800  # 秒
 try:
     with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "VERSION")) as _f:
-        __version__ = _f.read().strip() or "0.5.1"
+        __version__ = _f.read().strip() or "0.6.0"
 except Exception:
-    __version__ = "0.5.1"
+    __version__ = "0.6.0"
 
 # 只处理这些 GitHub 域名,一个都不多
 DOMAINS = [
@@ -124,6 +124,14 @@ DOMAINS = [
     "objects.githubusercontent.com",       # release 资产
     "release-assets.githubusercontent.com",
     "github-cloud.githubusercontent.com",
+    # ---- 页面完整性(缺了页面半瘫/图片裂图,2026-11 补齐) ----
+    "github.githubassets.com",             # 页面全部 JS/CSS 静态资源
+    "user-images.githubusercontent.com",   # issue/README 用户图片
+    "private-user-images.githubusercontent.com",  # 私有仓库图片(签名 URL)
+    "collector.github.com",                # 遥测埋点(被掐会拖慢页面加载)
+    # ---- 上传与 LFS ----
+    "uploads.github.com",                  # release 资产上传 / API 附件(POST)
+    "media.githubusercontent.com",         # git-lfs / 媒体内容重定向
 ]
 
 # DoH(国内可达、解析 GitHub 不投毒的公共 DNS),失败自动跳过
@@ -147,6 +155,27 @@ MIRRORS = [
     "https://ghproxy.cn/",
     "https://cors.isteed.cc/",
 ]
+
+# jsDelivr 官方三边界(cdn / fastly / gcore):gh 文件(raw)的 CDN 直读通道。
+# 只适用公共仓库、单文件 ≤20MB;两边不适用就 404,dl 通道级失败自动跳过,
+# 所以不验也有它——它是「多条回家的路」,不是「必须活的镜」。
+JSDELIVR_HOSTS = ["cdn.jsdelivr.net", "fastly.jsdelivr.net", "gcore.jsdelivr.net"]
+
+_RAW_URL_RE = re.compile(r"^https://raw\.githubusercontent\.com/([^/]+)/([^/]+?)/([^/]+?)/(.+)")
+
+
+def _is_raw_url(u):
+    return bool(_RAW_URL_RE.match(u))
+
+
+def _raw_jsdelivr(host, url):
+    """raw 链接 → jsDelivr 链接(https://<host>/gh/<u>/<r>@<ref>/<path>);
+    不是 raw 链接返回 None(通道自动退化为直连,不会错下)"""
+    m = _RAW_URL_RE.match(url)
+    if not m:
+        return None
+    o, r, ref, path = m.groups()
+    return "https://%s/gh/%s/%s@%s/%s" % (host, o, r, ref, path)
 
 # ---------------- 动态节点池(节点必须能定期更新,不能是死的) ----------------
 # 来源一律只当"候选":IP 要过 TLS+SNI 真实探测,镜像要能真实回源 release
@@ -200,22 +229,64 @@ def human(n):
     return "%.1f MB" % (n / 1e6) if n >= 1e6 else "%.1f KB" % (n / 1e3)
 
 
-def ssl_context():
-    """macOS 上不少 Python(venv/python.org 装的)找不到 CA 根证书,
-    导致所有 HTTPS 校验失败;这里显式指定证书包,兼容各种安装方式。"""
+def _cert_cands():
+    """证书包候选位:certifi(谁装的都行) + 各家系统证书包路径。
+    Windows 的 pip --user 装到 %APPDATA%\\Python\\PythonXY\\site-packages 也要找。"""
     cands = []
     try:
         import certifi
         cands.append(certifi.where())
     except Exception:
         pass
+    if IS_WIN:
+        ap, vi = os.environ.get("APPDATA", ""), sys.version_info
+        cands += [
+            os.path.join(os.path.dirname(sys.executable), "Lib", "site-packages",
+                         "certifi", "cacert.pem"),
+            os.path.join(ap, "Python", "Python%d%d" % (vi[0], vi[1]),
+                         "site-packages", "certifi", "cacert.pem"),
+        ]
     cands += ["/etc/ssl/cert.pem",                       # macOS 系统证书包
               "/usr/local/etc/openssl@3/cert.pem",
               "/usr/local/etc/openssl/cert.pem",
               "/opt/homebrew/etc/ca-certificates/cert.pem"]
-    for ca in cands:
+    return cands
+
+
+_CERT_INSTALL_TRIED = False   # 每进程最多现场装一次
+
+
+def _pip_install_certifi():
+    """现场补救:pip --user 装 certifi(静默,成功与否都不打断调用方)。
+    python.org 官方包/venv 是重灾区;系统 python 有 OS 证书链,一般轮不到这里。"""
+    global _CERT_INSTALL_TRIED
+    if _CERT_INSTALL_TRIED:
+        return False
+    _CERT_INSTALL_TRIED = True
+    try:
+        r = _run([sys.executable, "-m", "pip", "install", "--user", "--quiet",
+                  "certifi"], timeout=180, check=False, capture_output=True)
+        ok = r.returncode == 0
+        journal("certifi", "pip --user 安装%s" % ("成功" if ok else "失败"))
+        return ok
+    except Exception as e:
+        journal("certifi", "pip --user 安装失败:%s" % str(e)[:60])
+        return False
+
+
+def ssl_context():
+    """TLS 客户端上下文:显式指定证书包(不少 python.org/venv 装机找不到根证书,
+    CERTIFICATE_VERIFY_FAILED 全家黑);一个候选都没有时现场 pip --user 装 certifi。
+    不改变信任语义,只是把「该有的根证书」给配齐。"""
+    for ca in _cert_cands():
         if os.path.exists(ca):
             return ssl.create_default_context(cafile=ca)
+    if _pip_install_certifi():   # 装完当场再试一次
+        try:
+            import certifi
+            return ssl.create_default_context(cafile=certifi.where())
+        except Exception:
+            pass
     return ssl.create_default_context()
 
 
@@ -486,6 +557,28 @@ def _pool_rank(alive, stats):
     return sorted(out, key=key)
 
 
+# 自建镜像:用户自己的 gh-proxy Worker/VPS,~/.ghspeed/mirrors.json 持久。
+# 公共镜像平均寿命一两年,自建才是不死的;同样只在验证通过时进推荐链。
+CUSTOM_MIRRORS_FILE = os.path.join(os.path.expanduser("~"), ".ghspeed", "mirrors.json")
+
+
+def custom_mirrors():
+    try:
+        with open(CUSTOM_MIRRORS_FILE) as f:
+            xs = json.load(f).get("custom") or []
+        return [str(x).strip().rstrip("/") + "/" for x in xs if str(x).strip()]
+    except Exception:
+        return []
+
+
+def _custom_mirrors_save(xs):
+    os.makedirs(os.path.dirname(CUSTOM_MIRRORS_FILE), exist_ok=True)
+    tmp = CUSTOM_MIRRORS_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"custom": xs, "time": time.time()}, f)
+    os.replace(tmp, CUSTOM_MIRRORS_FILE)
+
+
 def mirror_pool(force=False):
     """镜像下单链:静态种子 + 发布站动态候选,**一律真验证、按实测吞吐排序**。
     静态默认序只是候选来源,不代表最快——低延迟≠宽管道,下载快(吞吐)才算快,
@@ -501,7 +594,8 @@ def mirror_pool(force=False):
         return _pool_urls(cached)   # 缓存里存的就是延迟序
 
     cands, seen = [], set()
-    for c in list(MIRRORS) + list(MIRROR_EXTRA_CANDIDATES):   # 静态不再免检
+    for c in list(MIRRORS) + list(MIRROR_EXTRA_CANDIDATES) + custom_mirrors():
+        # 自建镜像们排进候选,同样真验证 —— 活的才进推荐链
         if c not in seen:
             seen.add(c)
             cands.append(c)
@@ -586,7 +680,7 @@ def _env_csv(name, default):
 def static_candidates(domain):
     """内置候选 IP(来自 GitHub 官方公布的网段,历史稳定值)"""
     ips = set()
-    if domain in ("github.com", "gist.github.com"):
+    if domain in ("github.com", "gist.github.com", "uploads.github.com"):
         ips |= {"140.82.%d.%d" % (n, h) for n in range(112, 122) for h in (3, 4)}
         ips |= {"20.205.243.166", "20.27.177.113", "20.200.245.247",
                 "20.26.156.215", "20.248.137.49"}
@@ -594,8 +688,14 @@ def static_candidates(domain):
         ips |= {"140.82.%d.%d" % (n, h) for n in range(112, 122) for h in (5, 6)}
     elif domain == "codeload.github.com":
         ips |= {"140.82.%d.%d" % (n, h) for n in range(112, 122) for h in (9, 10)}
+    elif domain == "collector.github.com":
+        # 埋点域,与主站同段(Fastly/own CIDR 混部);错了验证会淘汰,无害
+        ips |= {"140.82.%d.%d" % (n, h) for n in range(112, 122) for h in (3, 4)}
     elif domain.endswith("githubusercontent.com"):
         ips |= {"185.199.%d.133" % n for n in (108, 109, 110, 111)}
+    elif domain.endswith("githubassets.com"):
+        # Fastly 的 pages 同段(.153);错了验证会淘汰,无害
+        ips |= {"185.199.%d.153" % n for n in (108, 109, 110, 111)}
     return ips
 
 
@@ -948,8 +1048,10 @@ PLIST_TMPL = """<?xml version="1.0" encoding="UTF-8"?>
     <array>
         <string>%(exe)s</string>
         <string>%(script)s</string>
-        <string>refresh</string>
+        <string>watch</string>
         <string>--quiet</string>
+        <string>--budget</string>
+        <string>900</string>
     </array>
     <key>StartInterval</key><integer>%(interval)d</integer>
     <key>Nice</key><integer>10</integer>
@@ -998,9 +1100,9 @@ def daemon_install():
     if IS_WIN:
         # SYSTEM 账号自带管理员权限;TR 内层引号由 schtasks 约定为 \"
         if script:
-            tr = '\\"%s\\" \\"%s\\" refresh --quiet' % (exe, script)
+            tr = '\\"%s\\" \\"%s\\" watch --quiet --budget 900' % (exe, script)
         else:
-            tr = '\\"%s\\" refresh --quiet' % exe
+            tr = '\\"%s\\" watch --quiet --budget 900' % exe
         try:
             _run(["schtasks", "/Create", "/F", "/RU", "SYSTEM",
                   "/SC", "MINUTE", "/MO", str(minutes),
@@ -1023,7 +1125,7 @@ def daemon_install():
         if r.returncode != 0:  # 旧系统兜底
             subprocess.run(["launchctl", "load", "-w", PLIST_PATH], check=False)
     else:
-        args = "refresh --quiet"
+        args = "watch --quiet --budget 900"
         exec_start = ("%s %s %s" % (exe, script, args)) if script else \
                      ("%s %s" % (exe, args))
         for path, body in (
@@ -1074,6 +1176,28 @@ def daemon_installed():
     if IS_MAC:
         return os.path.exists(PLIST_PATH)
     return os.path.exists(SYSTEMD_TIMER)
+
+
+def daemon_cmd_current():
+    """已装的定时任务是否已是当前命令模板(watch 自愈档)。
+
+    历史安装跑的是 refresh(固定 30 分钟一测,坏窗口最多盲 30 分钟);
+    升级后在下次 refresh 时静默迁移到 watch(健康几秒收工,坏窗口内加密重测)。
+    """
+    try:
+        if IS_WIN:
+            r = _run(["schtasks", "/Query", "/TN", WIN_TASK, "/V", "/FO", "LIST"],
+                     timeout=20, check=False, capture_output=True, text=True,
+                     errors="replace")
+            out = r.stdout or ""
+            if isinstance(out, bytes):
+                out = out.decode("utf-8", "replace")
+            return "watch" in out
+        path = PLIST_PATH if IS_MAC else SYSTEMD_SERVICE
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return "watch" in f.read()
+    except Exception:
+        return False
 
 
 # ---------------- 子命令 ----------------
@@ -1136,6 +1260,67 @@ def cmd_off(args):
     print("定时刷新任务:已卸载")
 
 
+def quick_health(timeout=4.0):
+    """钉选链路健康快查:github.com → api → codeload 逐个试当前钉选 IP,
+    谁通算谁(与 macOS 菜单栏同一套口径)。三域全不通 = 坏窗口,返回 False。
+    只做 3 次 TLS 握手,一两秒收工,给定时任务当廉价的「要不要自愈」开关。"""
+    try:
+        ips = current_map_from_hosts()
+    except Exception:
+        ips = {}
+    if not ips:
+        ips = {d: v["ip"] for d, v in (load_state() or {}).get("map", {}).items()}
+    for d in ("github.com", "api.github.com", "codeload.github.com"):
+        ip = ips.get(d)
+        if not ip:
+            continue
+        try:
+            probe(d, ip, timeout=timeout)
+            return True, d
+        except Exception:
+            continue
+    return False, ""
+
+
+def cmd_watch(args):
+    """坏窗口自愈守护:健康即退(几秒),坏窗口内按拍重测,预算用完收工。
+
+    给三端定时任务当「加密档」:平时一次快查就收工,链路坏窗口期自动升级为
+    每拍重测,窗口一开立刻把新 IP 钉上 —— macOS 菜单栏已有同款循环,
+    这里让 Windows/Linux(以及菜单栏没开着的场景)吃到同一份逻辑。
+    """
+    quiet = getattr(args, "quiet", False)
+    if not current_map_from_hosts():
+        if not quiet:
+            print("ghspeed: 未开启加速(hosts 无钉选),watch 无事可做")
+        return
+    t0, beat = time.time(), 0
+    while True:
+        beat += 1
+        ok, via = quick_health()
+        if ok:
+            if beat > 1:   # 本轮自愈成功,记一笔(健康快查不打日志)
+                journal("watch", "坏窗口走出(经 %s),重测 %d 轮" % (via, beat - 1))
+            if not quiet:
+                print("ghspeed: 链路正常(%s)%s" % (via, "" if beat == 1 else ",已重测恢复"))
+            return
+        left = args.budget - (time.time() - t0)
+        if left <= 0:
+            journal("watch", "坏窗口未走出,预算 %ds 用完(已重测 %d 轮)" % (args.budget, beat - 1))
+            if not quiet:
+                print("ghspeed: 坏窗口未走出(预算用完),下个周期继续")
+            return
+        if not quiet:
+            print("ghspeed: 链路不通,重测换优(剩余预算 %.0f 秒)..." % left, flush=True)
+        try:
+            cmd_refresh(argparse.Namespace(quiet=True))
+        except SystemExit:
+            pass   # refresh 的业务报错不该终止守护循环
+        pause = max(0, min(args.interval, left))
+        if pause:
+            time.sleep(pause)
+
+
 def cmd_refresh(args):
     def on_round(partial):
         if is_admin() and partial:
@@ -1157,6 +1342,10 @@ def cmd_refresh(args):
         else:
             journal("refresh", "IP 无变化")
             print("ghspeed: 刷新完成,IP 无变化")
+        # 存量安装迁移:定时任务还是旧 refresh 模板就静默升到 watch 自愈档
+        if daemon_installed() and not daemon_cmd_current():
+            daemon_install()
+            journal("refresh", "定时任务已迁移到 watch 自愈档")
     else:
         print("ghspeed: 已更新测速缓存(root 运行才会写 hosts)")
 
@@ -1217,8 +1406,12 @@ def cmd_status(args):
     except Exception:
         print("  ③ SSH 备用口 443 不通(ghspeed ssh443 test 细查)")
     found = detect_proxies(timeout=0.4)
-    print("  ④ 本地代理       %s" % (",".join(found) + "(ghspeed proxy detect 看接法)"
-          if found else "未发现常见端口"))
+    p = proxy_persisted()
+    if p:
+        print("  ④ 本地代理       已接管(仅 GitHub → %s;proxy off 可还原)" % p)
+    else:
+        print("  ④ 本地代理       %s" % (",".join(found) + "(proxy on 可一键接管)"
+              if found else "未发现常见端口"))
     if not IS_LINUX:
         print("  ⑤ 系统 DNS       %s" % ("已接管(dns off 可取消)"
               if dns_is_on() else "未接管(可选:ghspeed dns on)"))
@@ -1229,6 +1422,11 @@ def cmd_status(args):
                      % ("活着" if st["relay"] else "不在跑,已回落 DIRECT 兜底",
                         st["strategy"])
                      if st["enabled"] else "未开启(可选:ghspeed sni on)"))
+    ts = tier_state()
+    print("  ⑦ 下载档位      %s"
+          % ("已开启(127.0.0.1:%d;服务%s;tier off 可取消)"
+             % (ts["port"], "活着" if ts["alive"] else "没在跑,tier heal 自愈")
+             if ts["on"] else "未开启(可选:ghspeed tier on——浏览器下载无感走多通道)"))
     conns = live_connections()
     if conns:
         total = sum(n for _, n in conns)
@@ -1256,6 +1454,42 @@ def _fmt_when(ts):
 
 
 def cmd_mirrors(args):
+    op = getattr(args, "op", None)
+    if op:   # 自建镜像一行入池:ghspeed mirrors add|remove https://你的Worker域名/
+        u = (getattr(args, "mirror_url", None) or "").strip()
+        if "://" not in u:
+            sys.exit("用法:ghspeed mirrors %s https://你的gh-proxy域名/" % op)
+        u = u.rstrip("/") + "/"
+        xs = custom_mirrors()
+        if op == "add":
+            if u in xs:
+                print("已在自建清单里:%s" % u)
+                return
+            rtt = validate_mirror(u)
+            if rtt is None:
+                print("⚠ 此刻 HEAD 验证没通过(死了/坏窗口/地址写错);仍登记为候选——"
+                      "活没活是验证说了算,只要哪天能回源=实际可用就自动进推荐链")
+            else:
+                print("✓ 验证通过(HEAD %.0f ms)" % (rtt * 1000))
+            _custom_mirrors_save(xs + [u])
+            print("已登记自建镜像:%s" % u)
+            print("重验全池并按吞吐排序(约半分钟)...")
+            mirror_pool(force=True)
+            entries = dyn_load().get("mirrors") or []
+            inpool = any((e[0] if isinstance(e, (list, tuple)) else e) == u
+                         for e in entries)
+            if inpool:
+                print("✓ 已进推荐链(位置按实测吞吐)")
+            else:
+                print("(未进本轮推荐链:验证没过;24h 内自动重验,活的路自然会回来)")
+            return
+        if u not in xs:
+            print("自建清单里没有:%s(ghspeed mirrors add <url> 先登记)" % u)
+            return
+        xs.remove(u)
+        _custom_mirrors_save(xs)
+        print("已从自建清单移除:%s(下次重验不再出现)" % u)
+        return
     print("镜像健康检查(HEAD 活性 + 256KB 实测吞吐,真实 release 资产 jq-linux-amd64):")
     pool = mirror_pool()
     dyn = dyn_load()
@@ -1417,6 +1651,8 @@ def _dl_target(m, url):
     """chain 元素 → (实际 URL, 代理或 None)"""
     if m and m.startswith("PROXY:"):
         return url, m[6:]
+    if m and m.startswith("RAWJS:"):   # jsDelivr:URL 要重排,不是前缀
+        return (_raw_jsdelivr(m[6:], url) or url), None
     return ((m + url) if m else url), None
 
 
@@ -1602,8 +1838,17 @@ def cmd_dl(args):
         chain = [None]
     else:
         chain = [args.mirror] if args.mirror else mirror_pool()
+        if _is_raw_url(url):
+            # raw 文件额外补血 jsDelivr 三官方边界(公共仓、≤20MB;
+            # 在公共镜像都不通时它是第三条活路,不可用自动跳过不拖速)
+            chain += ["RAWJS:" + h for h in JSDELIVR_HOSTS]
         chain.append(None)  # 直连兜底(hosts 已优化)
     proxy = (args.proxy or os.environ.get("GHSPEED_PROXY", "")).strip() or None
+    if not proxy:
+        px = proxy_persisted()   # proxy on 接管过的:镜像+直连都失败时兜底用
+        if px:
+            proxy = px
+            print("==> 已接管本机代理作兜底:%s(proxy off 可取消)" % proxy)
     if proxy:
         chain.append("PROXY:" + proxy)   # 最后一级:本地代理
 
@@ -1690,6 +1935,9 @@ def cmd_url(args):
     print("直连  %s" % u)
     for e in pool:
         print("  %-24s %s%s" % (urlparse(e).netloc, e, u))
+    if _is_raw_url(u):
+        for h in JSDELIVR_HOSTS:   # raw 文件还有 CDN 直读这条等价路(公共仓,≤20MB)
+            print("  %-24s %s" % (h, _raw_jsdelivr(h, u)))
     print("\n池子全部真验证过(24h 缓存)。用法:curl -L <链接> -o 文件名,"
           "或 ghspeed dl <原链接> 自动选最快通道")
 
@@ -1750,11 +1998,17 @@ def cmd_git(args):
         _run(["git", "config", "--global", "--replace-all",
               "url.%shttps://github.com/.insteadOf" % m,
               "https://github.com/"], timeout=20, check=True)
-        print("已开启:git clone https://github.com/... 会自动改走镜像 %s" % m)
-        print("注意:push 前请先 sudo/普通运行 ghspeed git off,否则推送会失败")
+        # push 永远还原成真实地址:insteadOf 只重写 fetch,pushInsteadOf 把 push
+        # URL 拉回来 —— clone/fetch 吃镜像,推送不受影响,不用再「push 前先 off」
+        _run(["git", "config", "--global", "--replace-all",
+              "url.https://github.com/.pushInsteadOf",
+              "https://github.com/"], timeout=20, check=True)
+        print("已开启:git clone/fetch https://github.com/... 自动改走镜像 %s" % m)
+        print("push 自动走真实地址(pushInsteadOf 已配),无需先 off;还原:ghspeed git off")
     else:
         out = _run(
-            ["git", "config", "--global", "--get-regexp", r"^url\..*\.insteadof$"],
+            ["git", "config", "--global", "--get-regexp",
+             r"^url\..*insteadof$"],   # 同时覆盖 insteadof / pushinsteadof
             timeout=20, capture_output=True, text=True).stdout
         n = 0
         for line in out.splitlines():
@@ -1886,8 +2140,110 @@ def detect_proxies(timeout=0.8):
         return [p for p in ex.map(t, PROXY_PORTS) if p]
 
 
+PROXY_STATE_FILE = os.path.join(os.path.expanduser("~"), ".ghspeed", "proxy.json")
+
+
+def proxy_persisted():
+    """一键接管的本机代理(仅 GitHub 域用);没接管过返回 None"""
+    try:
+        with open(PROXY_STATE_FILE) as f:
+            return (json.load(f).get("proxy") or "").strip() or None
+    except Exception:
+        return None
+
+
+def _proxy_save(p):
+    os.makedirs(os.path.dirname(PROXY_STATE_FILE), exist_ok=True)
+    tmp = PROXY_STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"proxy": p, "time": time.time()}, f)
+    os.replace(tmp, PROXY_STATE_FILE)
+
+
+def _proxy_clear():
+    try:
+        os.remove(PROXY_STATE_FILE)
+    except FileNotFoundError:
+        pass
+
+
+def _sni_reapply_pac():
+    """SNI 分片开着就重发一次 PAC(让 proxy 跳的增减立即生效);没开返回 False"""
+    m = sni_mod()
+    if not (m and sni_state().get("enabled")):
+        return False
+    try:
+        m.sni_pac_on()
+        return True
+    except Exception:
+        return False
+
+
 def cmd_proxy(args):
+    action = getattr(args, "action", None)
+    if action == "on":
+        return _proxy_on()
+    if action == "off":
+        return _proxy_off()
+    return _proxy_detect()
+
+
+def _proxy_on():
+    """一键接管:只把 GitHub 域交给本机代理,其他网站一概不碰,off 原样还原。
+
+    接什么(三处,全部 GitHub 域级):
+      git   http.https://github.com/.proxy   —— clone/fetch/push/ls-remote 走代理
+      dl    下载通道链最后一级自动追加 PROXY  —— 镜像+直连都失败才用它
+      PAC   SNI 分片开着时,relay 后面加代理跳(relay 死了浏览器自动落到代理)
+    """
+    found = detect_proxies()
+    if not found:
+        sys.exit("未发现可用的本地 HTTP 代理口(SOCKS 口不认;Clash 开「混合端口」后重试)")
+    p = found[0]
+    git_on = shutil.which("git") is not None
+    if git_on:
+        _run(["git", "config", "--global", "--replace-all",
+              "http.https://github.com/.proxy", p], timeout=20, check=True)
+    _proxy_save(p)
+    pac_done = _sni_reapply_pac()
+    journal("proxy-on", p)
+    print("已接管(仅 GitHub):%s ✅" % p)
+    if git_on:
+        print("  - git:clone/fetch/push 走代理(取消:ghspeed proxy off)")
+    else:
+        print("  - git:未安装 git,此项跳过")
+    print("  - dl:镜像+直连都失败时自动经它下载")
+    print("  - PAC:%s" % ("已加代理跳(relay 死了浏览器自动落到它)"
+                         if pac_done else "SNI 分片未开,跳过(sni on 后再 proxy on 会自动带上)"))
+
+
+def _proxy_off():
+    p = proxy_persisted()
+    git_on = shutil.which("git") is not None
+    removed_git = False
+    if git_on:
+        r = _run(["git", "config", "--global", "--unset-all",
+                  "http.https://github.com/.proxy"],
+                 timeout=20, check=False, capture_output=True, text=True)
+        removed_git = r.returncode == 0
+    _proxy_clear()
+    pac_done = _sni_reapply_pac()
+    if not p and not removed_git:
+        print("本来就没有接管")
+        return
+    journal("proxy-off", p or "")
+    print("已还原(仅 GitHub 不再走 %s)✅" % (p or "本机代理"))
+    if git_on:
+        print("  - git:代理配置%s" % ("已移除" if removed_git else "本来就没配"))
+    if pac_done:
+        print("  - PAC:代理跳已摘除")
+
+
+def _proxy_detect():
     print("探测本机常见代理端口:%s" % ", ".join(map(str, PROXY_PORTS)))
+    p = proxy_persisted()
+    if p:
+        print("当前状态:已接管(仅 GitHub → %s;还原:ghspeed proxy off)" % p)
     found = detect_proxies()
     if not found:
         print("未发现可用的本地 HTTP 代理口(SOCKS 口不认;Clash 开「混合端口」即可)")
@@ -1895,13 +2251,11 @@ def cmd_proxy(args):
         print("  GHSPEED_PROXY=http://127.0.0.1:端口 ghspeed dl <url>")
         return
     print("可用代理:")
-    for p in found:
-        print("  + %s" % p)
-    p = found[0]
-    print("\n接法(只影响 GitHub,不动其他网站):")
-    print("  git:    git config --global http.https://github.com/.proxy %s" % p)
-    print("          取消:git config --global --unset http.https://github.com/.proxy")
-    print("  下载:   GHSPEED_PROXY=%s ghspeed dl <url>" % p)
+    for q in found:
+        print("  + %s" % q)
+    if not p:
+        print("\n一键接管(只影响 GitHub,不动其他网站;off 原样还原):")
+        print("  ghspeed proxy on")
 
 
 # ---------------- 系统 DNS:opt-in 全局接管,off 原样还原 ----------------
@@ -2156,6 +2510,7 @@ def sni_mod():
         m = importlib.util.module_from_spec(spec)
         for k, v in list(globals().items()):   # 先注入再执行:插件顶层
             m.__dict__.setdefault(k, v)        # 常量(_SNI_DIR 等)要用引擎设施
+        m.__dict__["_ENGINE_FILE"] = os.path.realpath(__file__)   # 插件回启引擎用(spawn 命令行是以引擎为入口的)
         spec.loader.exec_module(m)
     except Exception:
         if os.environ.get("GHSPEED_DEBUG"):
@@ -2182,7 +2537,30 @@ def sni_off(quiet=False):
 
 def sni_heal(quiet=False):
     m = sni_mod()
-    return m.sni_heal(quiet) if m else False
+    r = m.sni_heal(quiet) if m else False
+    if m:   # 下载档位开着但服务死了就一起复活(relay 复活是主体,tier 只是加分项)
+        try:
+            m.tier_heal(quiet)
+        except SystemExit:
+            pass   # tier 侧的业务提示(端口占用等)不该打断 heal 主流程
+    return r
+
+
+def tier_state():
+    m = sni_mod()
+    if not m:
+        return {"on": False, "alive": False, "ca": False, "port": 0}
+    return m.tier_state()
+
+
+def cmd_tier(args):
+    m = sni_mod()
+    if not m:
+        if getattr(args, "action", None) in (None, "state", "off"):
+            print("下载档位:未开启(SNI 插件缺失时不影响开关加速等其他功能)")
+            return
+        sys.exit("SNI 插件缺失:没找到 ghspeed_sni.py(重新安装最新版可修复)")
+    m.cmd_tier(args)
 
 
 def cmd_sni(args):
@@ -2257,7 +2635,10 @@ def main():
     sub.add_parser("probe", help="只测速,不写 hosts").set_defaults(func=cmd_probe)
     sub.add_parser("install", help="把本脚本安装为 /usr/local/bin/ghspeed(root)").set_defaults(func=cmd_install)
 
-    p = sub.add_parser("mirrors", help="检查各下载镜像的健康度(带跨会话记忆评分)")
+    p = sub.add_parser("mirrors", help="检查各下载镜像的健康度(带跨会话记忆评分);"
+                                       "add/remove<url> 自建镜像入池")
+    p.add_argument("op", nargs="?", choices=["add", "remove"], metavar="add|remove")
+    p.add_argument("mirror_url", nargs="?", metavar="https://你的Worker域名/")
     p.add_argument("--export", nargs="?", const="mirrors.json", metavar="FILE",
                    help="把实测通过的镜像池导出为 JSON(默认 ./mirrors.json)")
     p.set_defaults(func=cmd_mirrors)
@@ -2273,6 +2654,14 @@ def main():
     p = sub.add_parser("refresh", help="重新测速并刷新(定时任务调用)")
     p.add_argument("-q", "--quiet", action="store_true")
     p.set_defaults(func=cmd_refresh)
+
+    p = sub.add_parser("watch", help="坏窗口自愈守护:健康即退,坏窗口内加密重测(定时任务调用)")
+    p.add_argument("--budget", type=int, default=600, metavar="秒",
+                   help="本轮守护预算(默认 600;定时任务装的是 900)")
+    p.add_argument("--interval", type=int, default=60, metavar="秒",
+                   help="坏窗口内复查间隔(默认 60)")
+    p.add_argument("-q", "--quiet", action="store_true")
+    p.set_defaults(func=cmd_watch)
 
     p = sub.add_parser("dl", help="经镜像下载 GitHub 文件(支持断点续传)")
     p.add_argument("url", help="GitHub 链接,或 owner/repo[@分支或tag] 整仓速下(zip)")
@@ -2294,8 +2683,13 @@ def main():
     p.add_argument("action", choices=["on", "off", "test"])
     p.set_defaults(func=cmd_ssh443)
 
-    sub.add_parser("proxy", help="探测本机代理端口并给出接管命令(只检测,不接管)"
-                   ).set_defaults(func=cmd_proxy)
+    p = sub.add_parser("proxy", help="本机代理:无参只探测+看接管状态;on 一键接管(仅 GitHub);off 还原")
+    p.add_argument("action", nargs="?", choices=["on", "off"], help="缺省=只探测")
+    p.set_defaults(func=cmd_proxy)
+
+    p = sub.add_parser("tier", help="本地下载档位:浏览器无感多通道下载(下载域选择性改写镜像;tier on 后先 sni on)")
+    p.add_argument("action", nargs="?", choices=["on", "off", "state", "heal", "serve"], help="缺省=state")
+    p.set_defaults(func=cmd_tier)
 
     sub.add_parser("live", help="看当前谁正连着钉选 IP(请求吃到加速的实时视图)"
                    ).set_defaults(func=cmd_live)

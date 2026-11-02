@@ -127,19 +127,31 @@ sudo ghspeed off                 # 完全还原
 ghspeed on | off          开启/关闭(还原 hosts 与定时任务)
 ghspeed status            查看固定 IP、延迟、守护状态 + 多级通道自检
 ghspeed probe             手动测速(不写 hosts)
-ghspeed mirrors [--export 文件]  镜像健康检查(带跨会话记忆评分;--export 把实测池导出为 JSON)
-ghspeed url <链接|owner/repo>    把链接展开成直连 + 各镜像前缀的等价下载链接
+ghspeed mirrors [--export 文件]  镜像健康检查(带跨会话记忆评分;--export 把实测池导出为 JSON);
+                          add|remove <url> 自建镜像入池 —— 公共镜像平均寿命一两年,
+                          把 hunshcn/gh-proxy 部署到自己的 Cloudflare Workers/Docker 后
+                          一行登记(ghspeed mirrors add https://你的域名/),同样过真验证才进推荐链
+ghspeed url <链接|owner/repo>    把链接展开成直连 + 各镜像前缀的等价下载链接;raw 文件另附
+                          jsDelivr 官方三边界(cdn/fastly/gcore)的 CDN 等价路(公共仓,≤20MB)
 ghspeed refresh           重测并更新 hosts(root / 管理员)
+ghspeed watch             坏窗口自愈守护:健康几秒收工,坏窗口内 60 秒一拍重测,
+                          预算用完收工(定时任务已默认用它;健康时近乎零开销)
 ghspeed dl <url|owner/repo[@ref]> [-o 路径] [--direct] [--min-speed KB/s] [--proxy http://127.0.0.1:7890]
                           （owner/repo 自动转整仓 zip 经最快镜像下;≥8MB 资产自动切
                           8 片多通道并行,片级断点续传,失败退回单流链)
-ghspeed git on | off      git clone 走镜像(push 前记得 off)
+ghspeed git on | off      git clone/fetch 走镜像(push 自动走真实地址,pushInsteadOf)
 ghspeed ssh443 test|on|off   git 改走 ssh.github.com:443 官方备用 SSH 口
-ghspeed proxy             探测本机代理端口并给出接管命令(只检测,不接管)
+ghspeed proxy [on|off]    本机代理:无参只探测;on 把 GitHub 域一键交给本机代理
+                          (git + dl 兜底 + PAC 代理跳,可 off 原样还原)
 ghspeed dns on|off|show   系统 DNS 换干净公共 DNS(opt-in;off 永远可取消,没备份也能清扫回自动获取)
 ghspeed sni test|on|off|state|git   浏览器 SNI 分片(可选):ClientHello 拆散绕过识别,
                           仅 GitHub 域走本地 relay;`sni git on` 让 git clone/fetch
                           也走分片 relay(只写 github.com 域级配置,off 原样还原)
+ghspeed tier on|off|state   本地下载档位(可选,重头戏):浏览器无感下载——本地代理只对
+                          codeload/raw/objects 等文件域做选择性解密,把下载请求改写成
+                          最优镜像通道回源;github.com 网页与登录 Cookie 永不解密,
+                          其余域透明转发。on 会生成并安装本地 CA(用户级,off 自动摘除;
+                          macOS 免 sudo)。需先 sni on 让 PAC 生效;断点续传兼容
 ghspeed live             看当前谁正连着钉选 IP(请求吃到加速的实时视图)
 ghspeed activity         回放 ghspeed 自身动作日志(下载通道/刷新/开关)
 ghspeed hosts-export [文件]  测速结果导出成 GitHub520 兼容 hosts 文件(SwitchHosts 可直接指向;

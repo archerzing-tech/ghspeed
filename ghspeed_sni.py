@@ -1,6 +1,6 @@
 """GHSpeed 可选插件:浏览器 SNI 分片(本地 relay 把 ClientHello 拆散绕过识别)。
 
-v0.5.1 起从引擎主文件分拆:非核心功能不占核心文件的维护心智,主文件只留薄封装。
+v0.5.1 起从引擎主文件分拆(0.6.0 加 tier 档位):非核心功能不占核心文件的维护心智,主文件只留薄封装。
 由 ghspeed.py 在首次用到时懒加载(sni_mod()),并把引擎命名空间注入本模块
 ——插件内零改动直用 journal/_run/IS_WIN/DOMAINS 等引擎设施。文件缺失时
 引擎优雅降级(状态显示未开启,显式 on/test 才提示重装),核心功能分毫不差。
@@ -39,18 +39,35 @@ SNI_STRATS = ("direct", "split1", "snisplit", "disorder")
 
 def sni_pac_text():
     doms = ", ".join('"%s"' % d for d in DOMAINS)
+    # 代理 fallback 跳:proxy on 接管过本机代理时,PAC 变成
+    # relay → 本机代理 → DIRECT 三级;relay 挂了浏览器自动落到代理,
+    # 代理也没了才直连吃 hosts 钉选
+    hop = ""
+    try:
+        px = proxy_persisted()   # 引擎注入的接管状态
+        if px:
+            hop = "PROXY %s; " % px.split("://", 1)[-1].rstrip("/")
+    except Exception:
+        hop = ""
+    # 第一跳:下载档位开着就指向档口(网页域在档口里也是原样透明转发,
+    # 与 relay 完全同路);没开档位维持原 relay
+    first = "127.0.0.1:%d" % (TIER_PORT if tier_cfg().get("on") else SNI_PORT)
+    # 注意:%s(hop 跳)与 %d(端口)都在最后一个相邻字面量段里,
+    # 让 % (first, hop) 只作用于它 —— Python 的 % 优先级比 + 高,
+    # 占位符混在被 + 拆开的段里会炸
     return (
-        "// GHSpeed 浏览器 SNI 分片:仅下列 GitHub 域走本地分片 relay,其余一律 DIRECT\n"
+        "// GHSpeed 浏览器加速:仅下列 GitHub 域走本地代理,其余一律 DIRECT\n"
+        "// 档位开启时第一跳为下载档位(下载域自动改写镜像,网页域原样转发)\n"
         "function FindProxyForURL(url, host) {\n"
         "  host = host.toLowerCase();\n"
         "  var d = [" + doms + "];\n"
         "  for (var i = 0; i < d.length; i++) {\n"
         "    var s = \".\" + d[i];\n"
         "    if (host === d[i] || host.substring(host.length - s.length) === s)\n"
-        "      return \"PROXY 127.0.0.1:%d; DIRECT\";\n"
+        "      return \"PROXY %s; %sDIRECT\";\n"
         "  }\n"
         "  return \"DIRECT\";\n"
-        "}\n" % SNI_PORT)
+        "}\n" % (first, hop))
 
 
 def sni_pac_url():
@@ -209,6 +226,30 @@ def _sni_pump(a, b):
         pass
 
 
+def _read_head(cli, limit=16384):
+    """读到首个 \\r\\n\\r\\n 为止;返回 (head, rest);对端先断返回 None"""
+    req = b""
+    while b"\r\n\r\n" not in req and len(req) < limit:
+        d = cli.recv(4096)
+        if not d:
+            return None
+        req += d
+    head, _, rest = req.partition(b"\r\n\r\n")
+    return head, rest
+
+
+def _parse_connect(head):
+    """"CONNECT host:port HTTP/1.1" → (host, port, 其余浏览器捎带的字节);非 CONNECT 返回 None"""
+    line = head.split(b"\r\n", 1)[0].decode("latin1", "replace")
+    parts = line.split()
+    if len(parts) < 2 or parts[0].upper() != "CONNECT":
+        return None
+    hp = parts[1]
+    host = hp.rsplit(":", 1)[0].strip("[]").lower()
+    port = hp.rsplit(":", 1)[1] if ":" in hp else "443"
+    return host, port
+
+
 class _SniHandler(socketserver.BaseRequestHandler):
     def handle(self):
         try:
@@ -217,23 +258,21 @@ class _SniHandler(socketserver.BaseRequestHandler):
             pass
 
     def _relay(self):
-        req = b""
-        while b"\r\n\r\n" not in req and len(req) < 16384:
-            d = self.request.recv(4096)
-            if not d:
-                return
-            req += d
-        head, _, rest = req.partition(b"\r\n\r\n")
-        parts = head.split(b"\r\n", 1)[0].decode("latin1", "replace").split()
-        if len(parts) < 2 or parts[0].upper() != "CONNECT":
+        got = _read_head(self.request)
+        if got is None:
+            return
+        con = _parse_connect(got[0])
+        if not con:
             self.request.sendall(b"HTTP/1.1 403 Forbidden\r\n\r\n")
             return
-        hp = parts[1]
-        host = hp.rsplit(":", 1)[0].strip("[]").lower()
-        port = hp.rsplit(":", 1)[1] if ":" in hp else "443"
+        host, port = con
         if not any(host == d or host.endswith("." + d) for d in DOMAINS):
             self.request.sendall(b"HTTP/1.1 403 Forbidden\r\n\r\n")
             return
+        self._forward_fragment(host, int(port), got[1])
+
+    def _forward_fragment(self, host, port, rest):
+        """CONNECT 认可后的直连转发:分 ClientHello,双向泵(relay 与 tier 档共用)"""
         try:
             up = socket.create_connection((host, int(port)), timeout=15)
         except OSError:
@@ -374,6 +413,12 @@ def _sni_relay_alive():
         return False
 
 
+def _engine_path():
+    """引擎文件的真实路径:spwn 的命令行必须以引擎为入口(插件直接跑没有引擎设施)"""
+    p = globals().get("_ENGINE_FILE")
+    return p if p else os.path.abspath(__file__)
+
+
 def _sni_port_owner():
     """谁在 LISTEN 我们的端口(只查一次 netstat,5 秒超时);查不到返回 None"""
     if not IS_WIN:
@@ -407,10 +452,10 @@ def _sni_spawn_relay():
         else:
             pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
             cmd = [pyw if os.path.exists(pyw) else sys.executable,
-                   os.path.abspath(__file__), "sni", "serve"]
+                   _engine_path(), "sni", "serve"]
         kw = {"creationflags": 0x00000008 | 0x08000000}   # DETACHED | NO_WINDOW
     else:
-        cmd = ["/usr/bin/python3", os.path.abspath(__file__), "sni", "serve"]
+        cmd = ["/usr/bin/python3", _engine_path(), "sni", "serve"]
         kw = {"start_new_session": True}
     try:
         _popen(cmd, stdin=subprocess.DEVNULL,
@@ -493,7 +538,601 @@ def _sni_stop_cleanup():
         pass
 
 
-# ---- 系统 PAC 设置(mac:networksetup 要管理员;win:HKCU 注册表免管理员)----
+# ---------------- 本地下载档位(tier):浏览器无感多通道下载 ----------------
+# 原理:对「文件落地域」(codeload/raw/objects 等下载域)做选择性解密——本地生成
+# CA 签叶子证书,把浏览器发出的下载请求改写成最优镜像通道回源,流式吐回;
+# github.com 等网页域和登录 Cookie 永不解密(照旧透明转发,分片手法生效)。
+# 一切可逆:on 装 CA + 起服务 + PAC 第一跳切到档位;off 摘 CA + 停服务 + PAC 还原。
+# 没列进解密名单的域走的是和 relay 一模一样的转发路径,行为不变。
+
+TIER_PORT = int(os.environ.get("GHSPEED_TIER_PORT", "18778"))
+TIER_STATE = os.path.join(_SNI_DIR, "tier.json")
+TIER_PID = os.path.join(_SNI_DIR, "tier.pid")
+TIER_STOP = os.path.join(_SNI_DIR, "tier.stop")   # 协作停止哨兵(与 relay 同套路)
+TIER_CA = os.path.join(_SNI_DIR, "tier-ca.pem")
+TIER_CA_KEY = os.path.join(_SNI_DIR, "tier-ca.key")
+_TIER_CERT_DIR = os.path.join(_SNI_DIR, "tier-certs")   # 按域缓存的叶子证书
+
+_TIER_MITM_HOSTS = (     # 选择性解密名单:全是「文件下载」域,不含网页/登录域
+    "codeload.github.com",
+    "raw.githubusercontent.com",
+    "gist.githubusercontent.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+    "github-cloud.githubusercontent.com",
+    "media.githubusercontent.com",
+)
+
+_TIER_CA_CN = "GHSpeed Local Download CA"
+
+_TIER_CA_CNF = ("[req]\ndistinguished_name=dn\nprompt=no\nx509_extensions=v3ca\n"
+                "[dn]\ncommonName=%s\n" % _TIER_CA_CN +
+                "[v3ca]\nbasicConstraints=critical,CA:TRUE\n"
+                "keyUsage=critical,keyCertSign,cRLSign\nsubjectKeyIdentifier=hash\n")
+
+_TIER_REQ_CNF = ("[req]\ndistinguished_name=dn\nprompt=no\n"
+                 "[dn]\ncommonName=%s\n")     # %s = 目标域名
+
+_TIER_LEAF_EXT = ("basicConstraints=CA:FALSE\n"
+                  "keyUsage=critical,digitalSignature,keyEncipherment\n"
+                  "extendedKeyUsage=serverAuth\nsubjectAltName=DNS:%s\n")
+
+_RESP_KEEP = ("Content-Length", "Content-Range", "Content-Type", "Content-Encoding",
+              "Content-Disposition", "Accept-Ranges", "ETag", "Last-Modified", "Date")
+_UP_HDRS = ("user-agent", "accept", "range")   # 转给上游(镜像/直连)的请求头白名单
+
+_TIER_CTX_CACHE = {}      # host → ssl context(叶子证书按域缓存,进程内复用)
+_TIER_SERVER = None
+
+
+def tier_cfg():
+    try:
+        with open(TIER_STATE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _tier_cfg_save(d):
+    os.makedirs(_SNI_DIR, exist_ok=True)
+    with open(TIER_STATE + ".tmp", "w") as f:
+        json.dump(d, f, ensure_ascii=False)
+    os.replace(TIER_STATE + ".tmp", TIER_STATE)
+
+
+def _tier_alive():
+    try:
+        socket.create_connection(("127.0.0.1", TIER_PORT), timeout=0.4).close()
+        return True
+    except OSError:
+        return False
+
+
+def _tier_openssl(args):
+    """openssl 子命令统一入口;失败抛 RuntimeError(附 stderr 尾巴)"""
+    exe = shutil.which("openssl")
+    if not exe:
+        raise RuntimeError("本机没有 openssl")
+    r = _run([exe] + args, timeout=60, check=False, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError("openssl %s 失败:%s"
+                           % (args[0], ((r.stderr or r.stdout or "").strip())[-160:]))
+
+
+def _tier_ca_ensure():
+    """本地 CA:首次生成,之后一直用同一把(off 后重建也不换根,信任不用重装)"""
+    os.makedirs(_TIER_CERT_DIR, exist_ok=True)
+    if os.path.exists(TIER_CA) and os.path.exists(TIER_CA_KEY):
+        return TIER_CA
+    cnf = os.path.join(_TIER_CERT_DIR, "ca.cnf")
+    with open(cnf, "w") as f:
+        f.write(_TIER_CA_CNF)
+    _tier_openssl(["req", "-new", "-x509", "-newkey", "rsa:2048", "-nodes",
+                   "-days", "3825", "-keyout", TIER_CA_KEY, "-out", TIER_CA,
+                   "-config", cnf])
+    try:
+        os.chmod(TIER_CA_KEY, 0o600)
+    except Exception:
+        pass
+    # 新根 → 旧叶子全部作废(缓存文件按旧根签的,留着会 TLS 哑)
+    for fn in os.listdir(_TIER_CERT_DIR):
+        if fn.endswith((".pem", ".key")) and fn != "ca.cnf":
+            try:
+                os.remove(os.path.join(_TIER_CERT_DIR, fn))
+            except Exception:
+                pass
+    return TIER_CA
+
+
+def _tier_leaf(host):
+    """目标域的叶子证书(证书缓存文件;首次生成一次,之后的连接零 openssl 开销)"""
+    key = os.path.join(_TIER_CERT_DIR, "%s.key" % host)
+    pem = os.path.join(_TIER_CERT_DIR, "%s.pem" % host)
+    if not (os.path.exists(key) and os.path.exists(pem)):
+        reqcnf = os.path.join(_TIER_CERT_DIR, "_req.cnf")
+        extcnf = os.path.join(_TIER_CERT_DIR, "_leaf.ext")
+        with open(reqcnf, "w") as f:
+            f.write(_TIER_REQ_CNF % host)
+        with open(extcnf, "w") as f:
+            f.write(_TIER_LEAF_EXT % host)
+        csr = pem + ".csr"
+        _tier_openssl(["req", "-new", "-newkey", "rsa:2048", "-nodes",
+                       "-keyout", key, "-out", csr, "-subj", "/CN=%s" % host,
+                       "-config", reqcnf])
+        _tier_openssl(["x509", "-req", "-days", "826", "-in", csr,
+                       "-CA", TIER_CA, "-CAkey", TIER_CA_KEY,
+                       "-extfile", extcnf, "-out", pem, "-CAcreateserial"])
+        try:
+            os.remove(csr)
+        except Exception:
+            pass
+    return pem, key
+
+
+def _tier_tls_wrap(host, sock):
+    """把浏览器连接升级成我们做服务端的 TLS(叶子证书按域缓存)"""
+    try:
+        pem, key = _tier_leaf(host)
+        ctx = _TIER_CTX_CACHE.get(host)
+        if ctx is None:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(pem, key)
+            _TIER_CTX_CACHE[host] = ctx
+        return ctx.wrap_socket(sock, server_side=True)
+    except (OSError, ssl.SSLError, RuntimeError):
+        _TIER_CTX_CACHE.pop(host, None)   # 坏证书就地作废,下回重新生成
+        raise
+
+
+def _tier_channels(host, url):
+    """下载请求的通道链:镜像池(实测吞吐序)→ jsDelivr(raw 专属)→ 直连(吃 hosts)
+    → 本机已接管代理(最后兜底)。与 ghspeed dl 同一语义。"""
+    ch = []
+    try:
+        pool = [m for m in mirror_pool() if m]
+    except Exception:
+        pool = []
+    ch += pool
+    if _is_raw_url(url):
+        ch += ["RAWJS:" + h for h in JSDELIVR_HOSTS]
+    ch.append(None)
+    px = proxy_persisted()
+    if px:
+        ch.append("PROXY:" + px)
+    return ch
+
+
+def _tier_up_headers(head):
+    """白名单拷贝浏览器请求头:绝不转 Cookie/登录态/引用页,防镜像侧留痕"""
+    hs = {}
+    for ln in head.split(b"\r\n")[1:]:
+        k, _, v = ln.partition(b":")
+        k = k.strip().lower().decode("latin1")
+        if k in _UP_HDRS and v.strip():
+            hs[k] = v.strip().decode("latin1")
+    hs.setdefault("accept", "*/*")
+    hs["accept-encoding"] = "identity"   # 上游别给压缩:我们原样流回
+    return hs
+
+
+def _tier_open(method, target, headers, prox=None):
+    req = urllib.request.Request(target, headers=headers, method=method)
+    if prox:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": prox, "https": prox}),
+            urllib.request.HTTPSHandler(context=ssl_context()))
+        return opener.open(req, timeout=40)
+    return urllib.request.urlopen(req, timeout=40, context=ssl_context())
+
+
+def _tier_respond(cli, method, resp):
+    """上游响应 → 浏览器:按白名单回头部 + 流式倒字节;返回字节数"""
+    reason = (resp.reason or "OK").encode("latin1", "replace")
+    head = bytearray(b"HTTP/1.1 %d %s\r\n" % (resp.status, reason))
+    for k in _RESP_KEEP:
+        v = resp.headers.get(k)
+        if v:
+            head += b"%s: %s\r\n" % (k.encode(), v.encode("latin1", "replace"))
+    head += b"Connection: close\r\n\r\n"
+    cli.sendall(bytes(head))
+    if method == "HEAD":
+        return 0
+    n = 0
+    while True:
+        chunk = resp.read(65536)
+        if not chunk:
+            break
+        cli.sendall(chunk)
+        n += len(chunk)
+    return n
+
+
+def _tier_close_text(cli, code, text):
+    body = (
+        "<!doctype html><html><body style='font:14px -apple-system,sans-serif'>"
+        "<h3>GHSpeed 档位:%s</h3><p>全部通道(镜像/直连/代理)都没取到这个文件。"
+        "<br>可稍后重试,或右键镜像复制链接直接下载;断点续传不受影响。</p>"
+        "</body></html>") % text
+    data = body.encode("utf-8")
+    try:
+        cli.sendall(b"HTTP/1.1 %d Text\r\nConnection: close\r\n"
+                    b"Content-Type: text/html; charset=utf-8\r\n"
+                    b"Content-Length: %d\r\n\r\n" % (code, len(data)) + data)
+    except OSError:
+        pass
+
+
+def _tier_fetch(cli, method, url, head):
+    """核心改写:按通道链逐个试,取到即流回;全灭回 502(浏览器看到的是普通错误页)"""
+    reqh = _tier_up_headers(head)
+    last = ""
+    for ch in _tier_channels("", url):
+        tgt, prox = _dl_target(ch, url)
+        try:
+            resp = _tier_open(method, tgt, reqh, prox)
+            if resp.status not in (200, 206):
+                last = "HTTP %d via %s" % (resp.status, ch or "direct")
+                resp.close()
+                continue
+            try:
+                n = _tier_respond(cli, method, resp)
+            finally:
+                resp.close()
+            try:
+                journal("tier", "%s %.1fKB via %s" % (
+                    urlparse(url).hostname, n / 1024.0,
+                    urlparse(tgt).hostname if prox else (ch or "direct")))
+            except Exception:
+                pass
+            return True
+        except Exception as e:
+            last = "%s via %s" % (str(e)[:60], ch or "direct")
+            continue
+    _tier_close_text(cli, 502, last[:180] or "未知错误")
+    return False
+
+
+class _TierHandler(_SniHandler):
+    """tier 挡的连接分发:解密名单 → MITM 改写;其余 GitHub 域 → 原样分片转发"""
+
+    def _relay(self):
+        got = _read_head(self.request)
+        if got is None:
+            return
+        con = _parse_connect(got[0])
+        if con:
+            host, port = con
+            if host in _TIER_MITM_HOSTS:
+                self._serve_mitm(host, got[1])
+                return
+            if not any(host == d or host.endswith("." + d) for d in DOMAINS):
+                self.request.sendall(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+                return
+            self._forward_fragment(host, int(port), got[1])
+            return
+        # 非 CONNECT:当普通 HTTP 代理请求(终端设 http_proxy 的场景)
+        self._serve_plain(got[0])
+
+    def _serve_mitm(self, host, rest):
+        self.request.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+        try:
+            cli = _tier_tls_wrap(host, self.request)
+        except Exception:
+            return                     # 浏览器拒了我们的叶子证书:连接就地结束
+        try:
+            while True:
+                got = _read_head(cli)
+                if got is None:
+                    return
+                reqline = got[0].split(b"\r\n", 1)[0].decode("latin1", "replace")
+                m = re.match(r"(GET|HEAD)\s+(\S+)", reqline)
+                if not m:
+                    _tier_close_text(cli, 501, "档位只代理 GET/HEAD 下载(该方法没法改写)")
+                    return
+                if not _tier_fetch(cli, m.group(1).upper(),
+                                   "https://%s%s" % (host, m.group(2)), got[0]):
+                    return
+        finally:
+            try:
+                cli.close()
+            except Exception:
+                pass
+
+    def _serve_plain(self, head):
+        reqline = head.split(b"\r\n", 1)[0].decode("latin1", "replace")
+        m = re.match(r"(GET|HEAD)\s+(\S+)\s+HTTP/1", reqline)
+        if not m:
+            self.request.sendall(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n")
+            return
+        u = urlparse(m.group(2))
+        host = (u.hostname or "").lower()
+        if u.scheme != "http":
+            _tier_close_text(self.request, 400,
+                             "普通代理模式只收 http:// 目标(https 走 CONNECT)")
+            return
+        if not any(host == d or host.endswith("." + d) for d in DOMAINS):
+            _tier_close_text(self.request, 403, "仅限 GitHub 域(本档位是 GitHub 专用)")
+            return
+        _tier_fetch(self.request, m.group(1).upper(), m.group(2), head)
+
+
+def _tier_run_server():
+    """绑定端口并后台跑 tier 服务;被占返回 None(套路与 relay 相同)"""
+    global _TIER_SERVER
+    try:
+        srv = _SniServer(("127.0.0.1", TIER_PORT), _TierHandler)
+    except OSError:
+        return None
+    _TIER_SERVER = srv
+    try:
+        os.remove(TIER_STOP)
+    except OSError:
+        pass
+    try:
+        with open(TIER_PID, "w") as f:
+            f.write(str(os.getpid()))
+    except Exception:
+        pass
+    th = threading.Thread(target=srv.serve_forever,
+                          kwargs={"poll_interval": 0.3}, daemon=True)
+    th.start()
+    return srv, th
+
+
+def tier_serve():
+    """tier 前台 serve(命令行 tier serve 被后台进程调用)"""
+    os.makedirs(_SNI_DIR, exist_ok=True)
+    try:
+        _tier_ca_ensure()   # serve 独立进程没有 on 帮衬,自愈 CA(已存在时是平操作)
+    except RuntimeError as e:
+        sys.exit("CA 出不来:%s" % e)
+    r = _tier_run_server()
+    if r is None:
+        sys.exit("tier 端口 %d 被占" % TIER_PORT)
+    srv, th = r
+    while th.is_alive() and not os.path.exists(TIER_STOP):
+        th.join(0.4)
+    try:
+        srv.shutdown()
+    except Exception:
+        pass
+    try:
+        srv.server_close()
+    except Exception:
+        pass
+    try:
+        os.remove(TIER_PID)
+    except OSError:
+        pass
+    try:
+        os.remove(TIER_STOP)
+    except OSError:
+        pass
+
+
+def _tier_request_stop():
+    try:
+        with open(TIER_STOP, "w") as f:
+            f.write(str(os.getpid()))
+    except Exception:
+        pass
+    srv = _TIER_SERVER
+    if srv is not None:
+        threading.Thread(target=_sni_close_server, args=(srv,), daemon=True).start()
+
+
+def _tier_spawn():
+    """独立进程跑 tier(用户级,不依赖 App 活着);已在跑就不动"""
+    if _tier_alive():
+        return True
+    if IS_WIN:
+        if getattr(sys, "frozen", False):
+            cli = os.path.join(os.path.dirname(sys.executable), "ghspeed-cli.exe")
+            if not os.path.exists(cli):
+                return False
+            cmd = [cli, "tier", "serve"]
+        else:
+            pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+            cmd = [pyw if os.path.exists(pyw) else sys.executable,
+                   _engine_path(), "tier", "serve"]
+        kw = {"creationflags": 0x00000008 | 0x08000000}
+    else:
+        cmd = ["/usr/bin/python3", _engine_path(), "tier", "serve"]
+        kw = {"start_new_session": True}
+    try:
+        _popen(cmd, stdin=subprocess.DEVNULL,
+               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kw)
+    except Exception:
+        return False
+    for _ in range(20):
+        if _tier_alive():
+            return True
+        time.sleep(0.15)
+    return False
+
+
+def _tier_stop(deadline=5.0):
+    """停 tier:哨兵+pid+端口归属三连;套路与 relay 相同,有界时间收工"""
+    if not _tier_alive() and not os.path.exists(TIER_PID):
+        return False
+    t0 = time.monotonic()
+    _tier_request_stop()
+    pid = None
+    try:
+        with open(TIER_PID) as f:
+            pid = int(f.read().strip())
+    except Exception:
+        pass
+    if pid and pid != os.getpid():
+        try:
+            if IS_WIN:
+                _run(["taskkill", "/F", "/PID", str(pid)], timeout=4,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                os.kill(pid, 15)
+        except Exception:
+            pass
+    try:
+        os.remove(TIER_PID)
+    except Exception:
+        pass
+    while time.monotonic() - t0 < deadline:
+        if not _tier_alive():
+            break
+        time.sleep(0.2)
+    try:
+        os.remove(TIER_STOP)
+    except OSError:
+        pass
+    return not _tier_alive()
+
+
+def _tier_ca_install():
+    """把本地 CA 装进系统信任。mac 用户域(免 root);win certutil -user(免管理员)"""
+    if IS_WIN:
+        r = _run(["certutil", "-user", "-addstore", "Root", TIER_CA],
+                 timeout=60, check=False, capture_output=True, text=True)
+        return r.returncode == 0, ((r.stderr or r.stdout or "").strip())[-160:]
+    kc = os.path.expanduser("~/Library/Keychains/login.keychain-db")
+    if not os.path.exists(kc):
+        kc = os.path.expanduser("~/Library/Keychains/login.keychain")
+    r = _run(["/usr/bin/security", "add-trusted-cert", "-r", "trustRoot",
+              "-k", kc, TIER_CA], timeout=60, check=False,
+             capture_output=True, text=True)
+    return r.returncode == 0, ((r.stderr or r.stdout or "").strip())[-160:]
+
+
+def _tier_ca_uninstall():
+    """摘除本地(best effort;两次都试 mac;win 用 on 时记的 serial)"""
+    try:
+        if IS_WIN:
+            serial = tier_cfg().get("ca_serial") or ""
+            if not serial:
+                return False, ""
+            r = _run(["certutil", "-user", "-delstore", "Root", serial],
+                     timeout=60, check=False, capture_output=True, text=True)
+            return r.returncode == 0, ((r.stderr or "").strip())[-160:]
+        r1 = _run(["/usr/bin/security", "remove-trusted-cert", TIER_CA],
+                  timeout=60, check=False, capture_output=True, text=True)
+        kc = os.path.expanduser("~/Library/Keychains/login.keychain-db")
+        r2 = _run(["/usr/bin/security", "delete-certificate", "-c", _TIER_CA_CN, kc],
+                  timeout=60, check=False, capture_output=True, text=True)
+        r3 = _run(["/usr/bin/security", "remove-trusted-cert", "-d", TIER_CA],
+                  timeout=60, check=False, capture_output=True, text=True)
+        return r1.returncode == 0 or r2.returncode == 0 or r3.returncode == 0, \
+            ((r2.stderr or r1.stderr or "").strip())[-160:]
+    except Exception as e:
+        return False, str(e)[:160]
+
+
+def tier_state():
+    cfg = tier_cfg()
+    return {"on": bool(cfg.get("on")), "alive": _tier_alive(),
+            "ca": os.path.exists(TIER_CA), "port": TIER_PORT}
+
+
+def tier_heal(quiet=False):
+    """档位开着但服务死了 → 复活;复活不了 journal 记一笔(浏览器回落 DIRECT,不断网)"""
+    if not tier_cfg().get("on"):
+        return False
+    if _tier_alive() or _tier_spawn():
+        return False
+    journal("tier-heal", "档位服务复活失败(浏览器回落 DIRECT 吃 hosts 钉选)")
+    if not quiet:
+        print("下载档位的服务没起来:PAC 第一跳可能空转,浏览器自动回落直连;"
+              "重试 ghspeed tier on 或 tier off")
+    return True
+
+
+def tier_on():
+    if shutil.which("openssl") is None:
+        sys.exit("本机没有 openssl(mac 自带;Windows 要装 Git/GTK 后才有)")
+    if not (os.path.exists(TIER_CA) and os.path.exists(TIER_CA_KEY)):
+        print("生成本地 CA 根证书(一次性,下一轮 off 摘、再 on 不换根)...")
+        _tier_ca_ensure()
+    if not _tier_alive() and not _tier_spawn():
+        sys.exit("tier 服务没起来:端口 %d 被占?" % TIER_PORT)
+    ok, msg = _tier_ca_install()
+    _tier_cfg_save(dict(tier_cfg(), on=True, port=TIER_PORT, time=time.time()))
+    journal("tier-on", "CA%s" % ("已装" if ok else "未装(%s)" % msg[:40]))
+    print("已开启本地下载档位:127.0.0.1:%d" % TIER_PORT)
+    print("  · 解密名单(仅这些文件域会被改写到镜像通道):")
+    for h in _TIER_MITM_HOSTS:
+        print("      %s" % h)
+    print("  · github.com 网页/登录 Cookie 永不解密;其他 GitHub 域透明转发")
+    if ok:
+        print("  · 本地 CA 已装进当前用户信任域(摘除:ghspeed tier off)")
+    else:
+        print("  ⚠ 本地 CA 没装成:%s" % (msg or "(系统拒绝)"))
+        if not IS_WIN:
+            print("    手动导入:Finder 双击 %s 并选「始终信任」" % TIER_CA)
+        else:
+            print("    手动导入:certutil -user -addstore Root %s" % TIER_CA)
+    st = sni_state()
+    if st["enabled"]:
+        sni_pac_on()
+        print("  · PAC 已切到档位第一跳(网页域名行为不变,下载域自动改写)")
+    else:
+        print("  · PAC 还没接管:先 sudo ghspeed sni on(或菜单栏开 SNI 分片)浏览器才会吃档位")
+        print("  · 只想给某个终端用的话:export https_proxy=http://127.0.0.1:%d" % TIER_PORT)
+    print("  · 还原:ghspeed tier off")
+
+
+def tier_off(quiet=False, skip_pac=False):
+    cfg = tier_cfg()
+    if not cfg.get("on") and not _tier_alive():
+        if not quiet:
+            print("本来就未开启(下载档位)")
+        return False
+    cfg = dict(cfg, on=False, time=time.time())
+    _tier_cfg_save(cfg)
+    stopped = _tier_stop()
+    try:
+        ca_gone, msg = _tier_ca_uninstall()
+    except Exception as e:
+        ca_gone, msg = False, str(e)[:100]
+    if skip_pac:   # 被 sni off 连动调用的场景:PAC 正在整体还原,别在这里反写
+        journal("tier-off", "服务%s,CA%s" % ("已停" if stopped else "本没跑",
+                                             "已摘" if ca_gone else "没摘动"))
+        return True
+    try:
+        if sni_state().get("enabled"):
+            sni_pac_on()   # PAC 第一跳回到 relay(SNI 分片没开的话保持 off 语义)
+            pac = "已切回 relay 档" if sni_state().get("relay") else "已回到原 PAC 文案"
+        else:
+            pac = "PAC 未接管,没动"
+    except Exception:
+        pac = "(PAC 状态未知,略过重写)"
+    journal("tier-off", "服务%s,CA%s" % ("已停" if stopped else "本没跑",
+                                          "已摘" if ca_gone else "没摘动"))
+    if not quiet:
+        print("已还原下载档位:服务%s、本地 CA%s" % ("已停" if stopped else "本没跑",
+                                                    "已摘除" if ca_gone else "未摘(%s)" % (msg or "无")))
+        print("  · %s" % pac)
+    return True
+
+
+def cmd_tier(args):
+    action = getattr(args, "action", None) or "state"
+    if action == "on":
+        tier_on()
+    elif action == "off":
+        tier_off()
+    elif action == "serve":
+        tier_serve()
+    elif action == "heal":
+        tier_heal()
+    else:
+        st = tier_state()
+        print("下载档位:%s" % ("已开启" if st["on"] else "未开启(ghspeed tier on)"))
+        print("服务:127.0.0.1:%d(%s)" % (st["port"], "活着" if st["alive"] else "没在跑"))
+        print("本地 CA:%s(改写下载域需要它;tier on 会装、tier off 会摘)"
+              % ("已生成" if st["ca"] else "未生成"))
+        if st["on"] and not st["alive"]:
+            print("⚠ 开着但服务不在:浏览器回落直连;ghspeed tier heal 或重跑 tier on")
+
+
+# ---------------- 系统 PAC 设置(mac:networksetup 要管理员;win:HKCU 注册表免管理员)----
 
 SNI_BACKUP = os.path.join(_SNI_DIR, "sni_backup.json")
 
@@ -740,6 +1379,10 @@ def sni_off(quiet=False):
         if quiet:
             raise
         sys.exit("macOS 上取消 PAC 需要管理员:请用界面按钮,或 sudo ghspeed sni off")
+    try:
+        tier_off(quiet=True, skip_pac=True)   # 档位开着就一并收停/摘 CA
+    except Exception:
+        pass
     _sni_backup_clear()
     try:
         os.remove(SNI_PAC)
