@@ -2741,6 +2741,10 @@ def update_check_info(force=True, ttl=UPDATE_CACHE_TTL):
                 cached = json.load(f)
             if cached and time.time() - cached.get("ts", 0) < ttl:
                 cached["cached"] = True
+                # 缓存可能是旧版本写下的(自更新刚完成时必然如此):
+                # 用当前版本重算结论,升级完不再误报「有新版」
+                cached["update"] = (_ver_tuple(cached.get("tag", ""))
+                                    > _ver_tuple(__version__))
                 return cached
         except Exception:
             pass
@@ -2838,7 +2842,23 @@ def _update_download(info):
     return out
 
 
-def _update_open(path):
+def _update_cache_stamp_done(tag):
+    """自更新已交付(安装器已打开):就地改写检查缓存,别让界面底栏再喊「可升级」"""
+    try:
+        os.makedirs(os.path.dirname(UPDATE_CHECK_FILE), exist_ok=True)
+        with open(UPDATE_CHECK_FILE + ".tmp", "w") as f:
+            json.dump({"ts": time.time(), "current": __version__,
+                       "latest": tag.lstrip("vV"), "tag": tag,
+                       "update": False, "asset": {},
+                       "notes": "%s/tag/%s" % (UPDATE_WEB, tag)}, f,
+                      ensure_ascii=False)
+        os.replace(UPDATE_CHECK_FILE + ".tmp", UPDATE_CHECK_FILE)
+    except Exception:
+        pass
+
+
+def _update_open(path, tag=""):
+    _update_cache_stamp_done(tag)
     if IS_MAC:
         r = _run(["/usr/bin/open", path], timeout=30, check=False)
         if r.returncode == 0:
@@ -2893,7 +2913,7 @@ def cmd_update(args):
             return
     out = _update_download(info)
     print("\n新版已就绪 → %s" % out)
-    _update_open(out)
+    _update_open(out, tag=info.get("tag") or "")
 
 
 def cmd_install(args):

@@ -23,6 +23,40 @@ import ghspeed as eng
 
 APP = "GHSpeed"
 
+# ---------------- 单实例守卫 ----------------
+# 第二个实例不再开新窗口:发事件把已在跑的主窗口拉到前台,自己退出。
+# 这样无论 GHSpeed.exe 被谁反复拉起(安装器 postinstall、旧计划任务、手快双击),
+# 都不会出现「窗口无限弹」——内核对象随进程死亡自动释放,崩溃也锁不死下一个实例。
+_SI_MUTEX = "GHSpeed.Singleton"
+_SI_EVENT = "GHSpeed.ShowWindow"
+_si_mutex = None             # 本进程持有的 mutex 句柄;必须全程保活(被 GC 回收会失效)
+
+
+def _single_instance_enter(wait_for_prev=0.0):
+    """进入单实例。True=本实例是主实例(已持有锁);False=已有实例在跑(已发
+    「显示窗口」事件,本实例应退出)。wait_for_prev>0 给 --elevated-* 换权场景:
+    提权新实例先等旧实例退出(旧实例弹完 UAC 会自杀),拿不到锁再退回第二实例行为。
+    用「尝试获取」判归属,不读 GetLastError;WAIT_ABANDONED 兼容崩溃残留的锁。"""
+    global _si_mutex
+    k32 = ctypes.windll.kernel32
+    deadline = time.time() + wait_for_prev
+    while True:
+        h = k32.CreateMutexW(None, True, _SI_MUTEX)   # bInitialOwner=TRUE
+        if not h:
+            return True   # 内核对象创建失败:宁可极端情况双开,也不能让应用无声死掉
+        got = k32.WaitForSingleObject(h, 0)   # 0=已获得;0x80=前主崩溃,归我;超时=别人在跑
+        if got in (0, 0x80):
+            _si_mutex = h
+            return True
+        k32.CloseHandle(h)   # 立刻放手:旧实例退出后锁必须能真正消失
+        if time.time() >= deadline:
+            ev = k32.OpenEventW(0x0002, False, _SI_EVENT)   # EVENT_MODIFY_STATE
+            if ev:
+                k32.SetEvent(ev)
+                k32.CloseHandle(ev)
+            return False
+        time.sleep(0.3)
+
 
 class App:
     def __init__(self, root):
@@ -264,6 +298,11 @@ class App:
 
     def elevate(self, flag):
         """弹 UAC 重启自己;flag 让提权后的实例接着把事情做完"""
+        if flag in sys.argv:   # 已是提权重启的实例仍拿不到权限:绝不再自我拉起(防循环)
+            messagebox.showwarning(
+                APP, "已尝试管理员授权,但仍没有提权成功(可能被系统策略拦截)。\n"
+                     "请右键 GHSpeed 选「以管理员身份运行」后再试。")
+            return
         if getattr(sys, "frozen", False):  # PyInstaller 打包的 exe
             target, params = sys.executable, flag
         else:
@@ -672,6 +711,27 @@ class App:
 
     # ---------------- 窗口/托盘 ----------------
 
+    def watch_show_event(self):
+        """第二实例发来的「显示窗口」事件:把主窗口带到前台。
+        500ms 一拍非阻塞轮询(WaitForSingleObject 超时 0),不占 UI 线程。"""
+        try:
+            ev = ctypes.windll.kernel32.CreateEventW(None, False, False, _SI_EVENT)
+        except Exception:
+            return
+        if not ev:
+            return
+        self._show_ev = ev
+
+        def poll():
+            try:
+                if ctypes.windll.kernel32.WaitForSingleObject(ev, 0) == 0:
+                    self.show_window()
+                self.root.after(500, poll)
+            except Exception:
+                pass     # 窗口销毁等场景:静默停轮询
+
+        self.root.after(500, poll)
+
     def show_window(self):
         self.root.deiconify()
         self.root.lift()
@@ -754,9 +814,17 @@ def main():
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
     except Exception:
         pass
+    # 单实例:GHSpeed.exe 被反复拉起时(安装器/旧计划任务/手快双击),第二实例
+    # 只把已有主窗口拉到前台后自己退出,绝不堆叠窗口;
+    # --elevated-* 换权场景最多等 10 秒让旧实例退出再接管。
+    elevated = any(a in sys.argv
+                   for a in ("--elevated-on", "--elevated-dns", "--elevated-off"))
+    if not _single_instance_enter(10.0 if elevated else 0.0):
+        return
     try:
         root = tk.Tk()
         app = App(root)
+        app.watch_show_event()
         try:
             app.tray = setup_tray(app)
         except Exception:
