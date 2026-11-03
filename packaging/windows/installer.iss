@@ -22,6 +22,9 @@ PrivilegesRequired=lowest
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
+; 自更新时安装器会提示关闭正在运行的旧版(否则 exe 被锁无法替换)
+CloseApplications=yes
+RestartApplications=no
 OutputBaseFilename=GHSpeed-windows-setup-v{#AppVersion}
 OutputDir=..\..\dist
 UninstallDisplayName={#AppName}

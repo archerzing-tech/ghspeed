@@ -608,9 +608,24 @@ def _tier_alive():
         return False
 
 
+def _openssl_exe():
+    """Windows 常见安装位置的 openssl(Git for Windows 自带;不保证 PATH 里有)"""
+    exe = shutil.which("openssl")
+    if exe:
+        return exe
+    if IS_WIN:
+        for p in (r"C:\Program Files\Git\usr\bin\openssl.exe",
+                  r"C:\Program Files\Git\mingw64\bin\openssl.exe",
+                  r"C:\Program Files (x86)\Git\usr\bin\openssl.exe",
+                  r"C:\ProgramData\chocolatey\bin\openssl.exe"):
+            if os.path.exists(p):
+                return p
+    return None
+
+
 def _tier_openssl(args):
     """openssl 子命令统一入口;失败抛 RuntimeError(附 stderr 尾巴)"""
-    exe = shutil.which("openssl")
+    exe = _openssl_exe()
     if not exe:
         raise RuntimeError("本机没有 openssl")
     r = _run([exe] + args, timeout=60, check=False, capture_output=True, text=True)
@@ -1044,9 +1059,19 @@ def tier_heal(quiet=False):
     return True
 
 
-def tier_on():
-    if shutil.which("openssl") is None:
-        sys.exit("本机没有 openssl(mac 自带;Windows 要装 Git/GTK 后才有)")
+def tier_on(with_sni=False):
+    if _openssl_exe() is None:
+        sys.exit("本机没有 openssl(mac 自带;Windows 请安装 Git for Windows 后重试,"
+                 "它会自带 openssl)")
+    if with_sni and not sni_state()["enabled"]:
+        # 档位靠 PAC 把下载域送进本地代理;PAC 没接管时,浏览器根本吃不到档位。
+        # 界面点一下就能用,不用先记住「tier 前得 sni on」。
+        print("下载档位依赖 SNI 分片的 PAC 接管,先开启 SNI 分片...")
+        fail = sni_pac_on()
+        if not IS_WIN and fail:
+            sys.exit("PAC 没写进去:" + ";".join(fail))
+        _sni_spawn_relay()
+        journal("sni-on", "%s port%d(tier 连动开启)" % (sni_strategy(), SNI_PORT))
     if not (os.path.exists(TIER_CA) and os.path.exists(TIER_CA_KEY)):
         print("生成本地 CA 根证书(一次性,下一轮 off 摘、再 on 不换根)...")
         _tier_ca_ensure()
@@ -1115,7 +1140,7 @@ def tier_off(quiet=False, skip_pac=False):
 def cmd_tier(args):
     action = getattr(args, "action", None) or "state"
     if action == "on":
-        tier_on()
+        tier_on(with_sni=getattr(args, "with_sni", False))
     elif action == "off":
         tier_off()
     elif action == "serve":

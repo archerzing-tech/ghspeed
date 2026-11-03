@@ -113,13 +113,15 @@ sudo ghspeed off                 # 完全还原
 | 开机自启 | 用户级 LaunchAgent,无需管理员 |
 | 系统 DNS 接管(可选) | 换成国内不投毒公共 DNS(影响全部网站;原配置自动备份)。菜单项按**系统真实状态**在「接管/还原」间切换,还原永远可用(备份丢了也会清扫回自动获取) |
 | 浏览器 SNI 分片(可选) | 把 TLS ClientHello 拆散绕过 SNI 识别,浏览器直连 GitHub 网页;仅 GitHub 域走本地 relay。退出 App 时自动还原设置 |
+| 本地下载档位(可选) | 浏览器下载无感走镜像多通道:只对 codeload/raw/objects 等**文件域**选择性解密,github.com 网页与登录 Cookie 永不解密;首次开启会自动连带 SNI 分片并生成/安装本地 CA,关闭时服务与 CA 一键还原 |
+| 检查更新… | 查 GitHub Releases;有新版时菜单项变成「有新版 vX」并弹一次通知,点开即经镜像通道下载、sha256 校验、自动打开安装器 |
 | 关于 GHSpeed | 显示版本号与项目地址 |
 
 **启动即测**:应用一启动就在后台先跑一轮测速(用户权限,不写 hosts、不弹密码),结果存入种子缓存——之后点「开启加速」或「立即测速刷新」大多直接走种子轮,几秒完成。若当时已开启加速且配好了免密授权,启动测完还会自动把更优 IP 应用上,无需任何点击;检测到链路波动(已开启但不通)也会自动重测自愈。
 
 ### Windows 简易界面
 
-双击 `GHSpeed_gui.pyw` 打开(小窗,一屏放下):**开启加速、测速刷新、DNS、SNI、诊断** 五个按钮——镜像状态/活动连接并入「诊断」一次自检,镜像检测与关于在**托盘右键菜单**里。开启加速时弹 UAC 授权,提权后自动把开启做完。**操作不弹确认窗,成功结果直接写在窗口状态行**(只有失败才弹窗)。窗口关闭时最小化到系统托盘(装了 `pystray` 时),右键托盘图标退出;**退出时自动还原 SNI 分片设置**。
+双击 `GHSpeed_gui.pyw` 打开(小窗,一屏放下):**开启加速、测速刷新、DNS、SNI、下载档位、诊断** 六个按钮——镜像状态/活动连接并入「诊断」一次自检,镜像检测、检查更新与关于在**托盘右键菜单**里。开启加速时弹 UAC 授权,提权后自动把开启做完。**操作不弹确认窗,成功结果直接写在窗口状态行**(只有失败才弹窗)。窗口关闭时最小化到系统托盘(装了 `pystray` 时),右键托盘图标退出;**退出时自动还原 SNI 分片/下载档位**。启动后会静默查一次新版(6 小时缓存),有更新只改底栏提示,不弹窗。
 
 ### 命令行(三平台通用)
 
@@ -147,11 +149,16 @@ ghspeed dns on|off|show   系统 DNS 换干净公共 DNS(opt-in;off 永远可取
 ghspeed sni test|on|off|state|git   浏览器 SNI 分片(可选):ClientHello 拆散绕过识别,
                           仅 GitHub 域走本地 relay;`sni git on` 让 git clone/fetch
                           也走分片 relay(只写 github.com 域级配置,off 原样还原)
-ghspeed tier on|off|state   本地下载档位(可选,重头戏):浏览器无感下载——本地代理只对
+ghspeed tier on|off|state [--with-sni]   本地下载档位(可选,重头戏):浏览器无感下载——本地代理只对
                           codeload/raw/objects 等文件域做选择性解密,把下载请求改写成
                           最优镜像通道回源;github.com 网页与登录 Cookie 永不解密,
                           其余域透明转发。on 会生成并安装本地 CA(用户级,off 自动摘除;
-                          macOS 免 sudo)。需先 sni on 让 PAC 生效;断点续传兼容
+                          macOS 免 sudo)。需先 sni on 让 PAC 生效(加 --with-sni 自动带上;
+                          界面按钮默认就是连动开启);断点续传兼容
+ghspeed update [--check] [--yes] [--json]  检查/升级到新版:API 直连 → releases/latest
+                          重定向(直连+镜像)→ 资产页解析,三级退路查版本;下载复用镜像链
+                          + 分片 + 断点续传,sha256 校验通过后自动打开系统安装包
+                          (--check 只看;两个界面启动后也会静默查一次)
 ghspeed live             看当前谁正连着钉选 IP(请求吃到加速的实时视图)
 ghspeed activity         回放 ghspeed 自身动作日志(下载通道/刷新/开关)
 ghspeed hosts-export [文件]  测速结果导出成 GitHub520 兼容 hosts 文件(SwitchHosts 可直接指向;
@@ -242,7 +249,7 @@ GHSPEED_MIRRORS="https://your-mirror.example.com/" ghspeed dl <url>
 └─────────────────────────────────────────────┘
 ```
 
-只动这些 GitHub 域名:`github.com`、`api`、`codeload`、`*.githubusercontent.com` 等 13 个;不改系统代理、不改 DNS 服务器、其他网站一概不处理,`off` 后零残留。
+只动这些 GitHub 域名:`github.com`、`api`、`codeload`、`*.githubusercontent.com` 等 19 个;不改系统代理、不改 DNS 服务器、其他网站一概不处理,`off` 后零残留。
 
 ## 已知限制
 

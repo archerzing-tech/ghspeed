@@ -126,16 +126,39 @@ jobs:
         with:
           path: artifacts
 
+      - name: Generate SHA256SUMS
+        run: |
+          find artifacts -type f \( -name "*.pkg" -o -name "*.zip" -o -name "*.deb" -o -name "*.exe" \) -print0 \
+            | xargs -0 sha256sum | awk '{n=split($2,a,"/"); print $1"  "a[n]}' | sort -k2 > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           FILES=$(find artifacts -type f \( -name "*.pkg" -o -name "*.zip" -o -name "*.deb" -o -name "*.exe" \) | tr '\n' ' ')
+          FILES="$FILES SHA256SUMS.txt"
           echo "发布文件: $FILES"
           cat > notes.md <<'EOF'
           ## GHSpeed ${{ github.ref_name }}
 
           GitHub 专用加速工具:测速固定最快 IP 到 hosts + 镜像加速下载。只碰 GitHub,不碰其他网络。
+
+          ### v0.6.1 变更(能力补全:界面入口 + 自更新)
+          - **下载档位接进两个界面**:macOS 菜单栏「本地下载档位(可选)」、Windows 窗口
+            「下载档位」按钮——点一下即可,依赖的 SNI 分片会自动连带开启(不再需要先记
+            `sni on`);关闭时服务、本地 CA、PAC 一起收口。首次开启会生成并安装本地 CA,
+            只对 codeload/raw/objects 等文件域选择性解密,github.com 网页与登录 Cookie
+            永不解密
+          - **`ghspeed update` 自更新**:检查新版 → 经镜像通道下载 → sha256 校验 →
+            自动打开系统安装器。检查有三条退路(API 直连 / releases-latest 重定向走镜像 /
+            资产页解析),坏窗口里也能查;下载复用镜像链 + 分片并行 + 断点续传;
+            `--check` 只看,`--json` 给界面调用
+          - **两个界面每天静默查一次新版**:有更新才提示(macOS 菜单项变「有新版 vX」并
+            弹通知,Windows 底栏提示 + 托盘右键「检查更新」),不打断使用
+          - 菜单栏在已装 CLI 落后于 App 版本时自动改用 App 内引擎,并顺手把 CLI 升到
+            同版本——新增命令不再在旧 CLI 上报「invalid choice」
+          - 发布物附 `SHA256SUMS.txt`(更新校验与第三方复验共用)
 
           ### v0.6.0 变更(下载全链打通 + 自愈下沉引擎)
           - **本地下载档位 `ghspeed tier on`**(重头戏,可选):本地代理只对 codeload/raw/

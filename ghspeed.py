@@ -19,6 +19,7 @@ hosts 里只增加带标记的一小块,`ghspeed off` 可完整还原。
 
 import argparse
 import concurrent.futures as cf
+import hashlib
 import json
 import os
 import re
@@ -29,6 +30,7 @@ import subprocess
 import sys
 import threading
 import time
+import types
 import urllib.request
 from urllib.parse import urlparse, unquote
 
@@ -105,9 +107,9 @@ REFRESH_INTERVAL = 1800  # 秒
 try:
     with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "VERSION")) as _f:
-        __version__ = _f.read().strip() or "0.6.0"
+        __version__ = _f.read().strip() or "0.6.1"
 except Exception:
-    __version__ = "0.6.0"
+    __version__ = "0.6.1"
 
 # 只处理这些 GitHub 域名,一个都不多
 DOMAINS = [
@@ -211,6 +213,16 @@ GITHUB_URL_RE = re.compile(
     re.I)
 
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X) ghspeed/1.0"
+
+# ---------------- 自更新 ----------------
+# 检查:API 直连 → releases/latest 重定向(直连 + 镜像)→ 资产页解析;
+# 下载:复用 dl 的镜像链 + 分片 + 断点续传;校验:API digest 或 SHA256SUMS.txt;
+# 安装:只负责打开系统安装包,不静默替换——用户始终看得见发生了什么。
+UPDATE_REPO = "archerzing-tech/ghspeed"
+UPDATE_API = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
+UPDATE_WEB = "https://github.com/%s/releases" % UPDATE_REPO
+UPDATE_CHECK_FILE = os.path.join(os.path.expanduser("~"), ".ghspeed", "update.json")
+UPDATE_CACHE_TTL = 6 * 3600
 
 # ---------------- 小工具 ----------------
 
@@ -2598,6 +2610,292 @@ def cmd_activity(args):
         print("  %s  %-9s %s" % (t, e.get("action", ""), e.get("detail", "")))
 
 
+# ---------------- 自更新:检查 / 下载 / 校验 / 打开安装包 ----------------
+
+
+def _ver_tuple(s):
+    m = re.search(r"(\d+)\.(\d+)\.(\d+)", str(s or ""))
+    return tuple(int(x) for x in m.groups()) if m else (0, 0, 0)
+
+
+def _update_mirror_bases(limit=4):
+    """查更新用的镜像前缀:只吃已有结论(缓存池 + 静态种子 + 自建),绝不现场
+    验证——查更新必须快,不能为了一个 HEAD 把几十个镜像全测一遍。"""
+    out = []
+    try:
+        out += _pool_urls(dyn_load().get("mirrors") or [])
+    except Exception:
+        pass
+    out += list(MIRRORS) + custom_mirrors()
+    seen, res = set(), []
+    for u in out:
+        u = (u or "").strip().rstrip("/") + "/"
+        if u and u not in seen:
+            seen.add(u)
+            res.append(u)
+    return res[:limit]
+
+
+def _fetch_final(url, timeout=10):
+    """抓文本 + 最终 URL(不跟丢重定向:releases/latest 靠它拿 tag)"""
+    req = urllib.request.Request(url, headers={"User-Agent": UA,
+                                               "accept": "*/*"})
+    with urllib.request.urlopen(req, timeout=timeout,
+                                context=ssl_context()) as r:
+        return r.read(1 << 20).decode("utf-8", "replace"), r.geturl()
+
+
+def _release_info_from_api(timeout=10):
+    d = json.loads(fetch_url(UPDATE_API, timeout=timeout))
+    tag = (d.get("tag_name") or "").strip()
+    if not tag:
+        raise RuntimeError("API 没有返回 tag_name")
+    assets = []
+    for a in d.get("assets") or []:
+        dig = (a.get("digest") or "").strip().lower()
+        assets.append({"name": a.get("name") or "",
+                       "url": a.get("browser_download_url") or "",
+                       "size": int(a.get("size") or 0),
+                       "sha256": dig.split(":", 1)[-1] if dig else ""})
+    return {"tag": tag, "assets": assets, "source": "api.github.com"}
+
+
+def _release_assets_from_web(tag, timeout=10):
+    """API 够不着时的资产清单退路:GitHub 的 expanded_assets 片段是静态 HTML"""
+    for base in [""] + _update_mirror_bases(limit=2):
+        url = "%s/%s/releases/expanded_assets/%s" % (
+            base.rstrip("/") if base else "https://github.com", UPDATE_REPO, tag)
+        try:
+            html, _ = _fetch_final(url, timeout=timeout)
+        except Exception:
+            continue
+        names = re.findall(r"/releases/download/[^\"'<>]+/([^\"'<>/]+)", html)
+        if not names:
+            continue
+        seen, assets = set(), []
+        for n in names:
+            if n in seen:
+                continue
+            seen.add(n)
+            assets.append({"name": n,
+                           "url": "https://github.com/%s/releases/download/%s/%s"
+                                  % (UPDATE_REPO, tag, n),
+                           "size": 0, "sha256": ""})
+        return assets
+    return []
+
+
+def _release_info_from_web(timeout=10):
+    """API 被掐时的退路:releases/latest 的 302 指向 tag,资产页再拿文件名"""
+    errs = []
+    for base in [""] + _update_mirror_bases():
+        url = (base + UPDATE_WEB + "/latest") if base else (UPDATE_WEB + "/latest")
+        try:
+            html, final = _fetch_final(url, timeout=timeout)
+        except Exception as e:
+            errs.append("%s:%s" % (urlparse(url).netloc or "直连", str(e)[:40]))
+            continue
+        m = (re.search(r"/releases/tag/([^/\"'?#<>]+)", final or "")
+             or re.search(r"/releases/tag/([^/\"'?#<>]+)", html))
+        if not m:
+            errs.append("%s:没找到版本号" % (urlparse(url).netloc or "直连"))
+            continue
+        tag = unquote(m.group(1)).strip()
+        return {"tag": tag,
+                "assets": _release_assets_from_web(tag, timeout),
+                "source": urlparse(url).netloc or "github.com"}
+    raise RuntimeError("; ".join(errs[:3]) or "没有可用通道")
+
+
+def _update_asset_names(tag):
+    v = tag.lstrip("vV")
+    if IS_MAC:
+        # pkg 优先(双击即装、装完自动拉起);zip 是免安装兜底
+        return ["GHSpeed-macos-%s.pkg" % v, "GHSpeed-macos-%s.zip" % tag]
+    if IS_WIN:
+        return ["GHSpeed-windows-setup-%s.exe" % tag,
+                "GHSpeed-windows-%s.zip" % tag]
+    return ["ghspeed_%s_all.deb" % v]
+
+
+def _pick_asset(tag, assets):
+    names = _update_asset_names(tag)
+    by = {a.get("name"): a for a in (assets or [])}
+    for n in names:
+        if n in by and by[n].get("url"):
+            return by[n]
+    if assets:   # 有清单但没有当前平台的包:不瞎猜,交给上层报错
+        return None
+    # 清单没拿到:按命名规则拼,404 时 dl 会明确报错,不会装错东西
+    return {"name": names[0],
+            "url": "https://github.com/%s/releases/download/%s/%s"
+                   % (UPDATE_REPO, tag, names[0]),
+            "size": 0, "sha256": ""}
+
+
+def update_check_info(force=True, ttl=UPDATE_CACHE_TTL):
+    """检查新版。force=False 时吃 6h 缓存(界面启动自动查不重复打网络)"""
+    if not force:
+        try:
+            with open(UPDATE_CHECK_FILE) as f:
+                cached = json.load(f)
+            if cached and time.time() - cached.get("ts", 0) < ttl:
+                cached["cached"] = True
+                return cached
+        except Exception:
+            pass
+    try:
+        info = _release_info_from_api()
+    except Exception as e1:
+        try:
+            info = _release_info_from_web()
+        except Exception as e2:
+            raise RuntimeError("检查更新失败:%s / %s"
+                               % (str(e1)[:60], str(e2)[:80]))
+    tag = info["tag"]
+    doc = {"ts": time.time(), "current": __version__,
+           "latest": tag.lstrip("vV"), "tag": tag,
+           "update": _ver_tuple(tag) > _ver_tuple(__version__),
+           "source": info.get("source") or "",
+           "asset": _pick_asset(tag, info.get("assets") or []),
+           "notes": "%s/tag/%s" % (UPDATE_WEB, tag)}
+    try:
+        os.makedirs(os.path.dirname(UPDATE_CHECK_FILE), exist_ok=True)
+        with open(UPDATE_CHECK_FILE + ".tmp", "w") as f:
+            json.dump(doc, f, ensure_ascii=False)
+        os.replace(UPDATE_CHECK_FILE + ".tmp", UPDATE_CHECK_FILE)
+    except Exception:
+        pass
+    return doc
+
+
+def _update_sums(tag):
+    """SHA256SUMS.txt(经直连/镜像取);没有就返回 {},上层降级为不校验并提示"""
+    u = ("https://github.com/%s/releases/download/%s/SHA256SUMS.txt"
+         % (UPDATE_REPO, tag))
+    for base in [""] + _update_mirror_bases(limit=2):
+        try:
+            txt = fetch_url((base + u) if base else u, timeout=10)
+        except Exception:
+            continue
+        sums = {}
+        for line in txt.splitlines():
+            p = line.split()
+            if len(p) == 2 and re.fullmatch(r"[0-9a-fA-F]{64}", p[0]):
+                sums[p[1].lstrip("*")] = p[0].lower()
+        if sums:
+            return sums
+    return {}
+
+
+def _sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _update_download(info):
+    asset = info.get("asset") or {}
+    name = asset.get("name") or ""
+    dldir = os.path.join(os.path.expanduser("~"), "Downloads")
+    try:
+        os.makedirs(dldir, exist_ok=True)
+    except OSError:
+        dldir = os.path.join(os.path.expanduser("~"), ".ghspeed")
+        os.makedirs(dldir, exist_ok=True)
+    out = os.path.join(dldir, name)
+    expected = (asset.get("sha256") or "").lower()
+    if not expected:
+        expected = _update_sums(info["tag"]).get(name, "")
+    if os.path.exists(out) and expected and _sha256_file(out) == expected:
+        print("安装包已在 %s,校验通过,不重复下载" % out)
+    else:
+        if os.path.exists(out):
+            try:
+                os.remove(out)
+            except OSError:
+                pass
+        cmd_dl(types.SimpleNamespace(url=asset["url"], output=out,
+                                     mirror=None, direct=False,
+                                     min_speed=25.0, proxy=None))
+        if not os.path.exists(out):
+            sys.exit("下载未完成:%s" % out)
+        if not expected:
+            print("⚠ 该版本没提供 sha256 校验和,已跳过完整性校验")
+        else:
+            got = _sha256_file(out)
+            if got != expected:
+                try:
+                    os.remove(out)
+                except OSError:
+                    pass
+                sys.exit("sha256 校验失败(下载件已删除):期望 %s… 实际 %s…"
+                         % (expected[:12], got[:12]))
+            print("sha256 校验通过 ✅")
+    journal("update", "%s → v%s" % (name, info["latest"]))
+    return out
+
+
+def _update_open(path):
+    if IS_MAC:
+        r = _run(["/usr/bin/open", path], timeout=30, check=False)
+        if r.returncode == 0:
+            print("已打开安装器:按提示完成安装(会替换 /Applications/GHSpeed.app)")
+            print("安装完成后,请先退出旧版菜单栏图标(🐙 → 退出)再重新打开。")
+        else:
+            print("没能自动打开,请手动双击:%s" % path)
+    elif IS_WIN:
+        try:
+            os.startfile(path)
+            print("已启动安装器:按提示完成安装(UAC 选「是」)。")
+        except Exception as e:
+            print("没能自动打开(%s),请手动运行:%s" % (e, path))
+    else:
+        print("请手动安装:sudo dpkg -i %s" % path)
+
+
+def cmd_update(args):
+    try:
+        info = update_check_info(force=not getattr(args, "cache", False))
+    except Exception as e:
+        if getattr(args, "json", False):
+            print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False))
+            sys.exit(2)
+        sys.exit(str(e))
+    if getattr(args, "json", False):
+        print(json.dumps(dict(info, ok=True), ensure_ascii=False))
+        return
+    print("当前版本:v%s" % info["current"])
+    print("最新版本:%s(%s)" % (info["tag"], info.get("source") or "GitHub"))
+    if not info["update"]:
+        print("已是最新版本 ✅")
+        return
+    asset = info.get("asset") or {}
+    print("发现新版 🎉")
+    if asset.get("size"):
+        print("  安装包:%s(%s)" % (asset["name"], human(asset["size"])))
+    print("  发布说明:%s" % info["notes"])
+    if getattr(args, "check", False):
+        print("\n升级:ghspeed update(经镜像通道下载,校验后自动打开安装包)")
+        return
+    if not asset.get("url"):
+        sys.exit("这个版本没有适配当前平台的安装包,请到 %s 手动下载"
+                 % info["notes"])
+    if not getattr(args, "yes", False):
+        try:
+            ans = input("\n下载并打开安装包? [Y/n] ").strip().lower()
+        except EOFError:
+            sys.exit("非交互环境请加 --yes")
+        if ans not in ("", "y", "yes"):
+            print("已取消")
+            return
+    out = _update_download(info)
+    print("\n新版已就绪 → %s" % out)
+    _update_open(out)
+
+
 def cmd_install(args):
     need_root()
     src = os.path.realpath(__file__)
@@ -2689,6 +2987,8 @@ def main():
 
     p = sub.add_parser("tier", help="本地下载档位:浏览器无感多通道下载(下载域选择性改写镜像;tier on 后先 sni on)")
     p.add_argument("action", nargs="?", choices=["on", "off", "state", "heal", "serve"], help="缺省=state")
+    p.add_argument("--with-sni", action="store_true",
+                   help="tier on 时顺带开启 SNI 分片(PAC 才会把下载域交给档位)")
     p.set_defaults(func=cmd_tier)
 
     sub.add_parser("live", help="看当前谁正连着钉选 IP(请求吃到加速的实时视图)"
@@ -2696,6 +2996,13 @@ def main():
 
     sub.add_parser("activity", help="回放 ghspeed 自身动作日志(下载/刷新/开关)"
                    ).set_defaults(func=cmd_activity)
+
+    p = sub.add_parser("update", help="检查/升级到新版本(经镜像通道下载,sha256 校验后打开安装包)")
+    p.add_argument("--check", action="store_true", help="只检查,不下载")
+    p.add_argument("-y", "--yes", action="store_true", help="跳过确认")
+    p.add_argument("--json", action="store_true", help="机器可读输出(界面调用)")
+    p.add_argument("--cache", action="store_true", help="允许使用 6 小时内的检查缓存")
+    p.set_defaults(func=cmd_update)
 
     p = sub.add_parser("dns", help="系统 DNS 换成干净公共 DNS(opt-in,影响全部网站;off 原样还原)")
     p.add_argument("action", choices=["on", "off", "show"])

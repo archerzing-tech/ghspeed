@@ -52,6 +52,9 @@ class App:
         self.dns_btn.pack(side="left", padx=(6, 0))
         self.sni_btn = tk.Button(bar, text="SNI 分片", padx=8, command=self.toggle_sni)
         self.sni_btn.pack(side="left", padx=(6, 0))
+        self.tier_btn = tk.Button(bar, text="下载档位", padx=8,
+                                  command=self.toggle_tier)
+        self.tier_btn.pack(side="left", padx=(6, 0))
         self.diag_btn = tk.Button(bar, text="诊断", padx=8, command=self.run_diag)
         self.diag_btn.pack(side="left", padx=(6, 0))
 
@@ -59,9 +62,11 @@ class App:
                                 state="disabled")
         self.out.pack(fill="both", expand=True, padx=10, pady=(2, 4))
 
-        tk.Label(root, text="v%s · 只碰 GitHub · 镜像检测/关于在托盘右键菜单" % eng.__version__,
-                 anchor="e", fg="#999999",
-                 font=("Microsoft YaHei UI", 8)).pack(fill="x", padx=10, pady=(0, 6))
+        self.footer = tk.Label(
+            root, text="v%s · 只碰 GitHub · 镜像检测/检查更新在托盘右键菜单"
+                       % eng.__version__,
+            anchor="e", fg="#999999", font=("Microsoft YaHei UI", 8))
+        self.footer.pack(fill="x", padx=10, pady=(0, 6))
 
         self.busy = False
         self._job = 0
@@ -72,11 +77,13 @@ class App:
         self._lat_probe_at = 0.0       # 上次探测时刻(25 秒内复用,不刷屏式探测)
         self._bad_streak = 0           # 连续异常轮数(≥2 才喊波动,防单次超时误报)
         self._exit_after_done = "--elevated-off" in sys.argv
+        self._update_tag = None     # 发现的新版 tag(底栏提示,不打扰)
         self.tray = None            # 托盘图标(pystray),main() 里装配
         self._prime_from_state()
         self.refresh_ui()
         self.root.after(300_000, self._auto_probe_loop)   # 5 分钟一拍链路快查
         threading.Thread(target=self._sni_boot, daemon=True).start()
+        threading.Thread(target=self._update_boot, daemon=True).start()
         if "--elevated-on" in sys.argv:  # UAC 提权重启后自动开启
             self.root.after(300, self.toggle)
         elif "--elevated-dns" in sys.argv:  # UAC 提权重启后自动接管/还原 DNS
@@ -157,9 +164,14 @@ class App:
             sni_real = eng.sni_state()["enabled"]
         except Exception:
             sni_real = False
-        self.root.after(0, lambda: self._lat_done(ms, via, dns_real, sni_real))
+        try:
+            tier_real = eng.tier_state()["on"]
+        except Exception:
+            tier_real = False
+        self.root.after(0, lambda: self._lat_done(ms, via, dns_real, sni_real,
+                                                  tier_real))
 
-    def _lat_done(self, ms, via, dns_real, sni_real=False):
+    def _lat_done(self, ms, via, dns_real, sni_real=False, tier_real=False):
         self._lat_running = False
         # 防抖:单轮异常不改口(可能是单次超时),连续两轮异常才承认「波动」,
         # 状态行不再在 ms 和「波动中」之间反复横跳
@@ -183,6 +195,7 @@ class App:
             self.latency.config(text="github.com:当前直连不通(建议开启加速)")
         self.dns_btn.config(text="DNS 还原" if dns_real else "DNS 接管")
         self.sni_btn.config(text="SNI 还原" if sni_real else "SNI 分片")
+        self.tier_btn.config(text="档位还原" if tier_real else "下载档位")
 
     @staticmethod
     def _measure():
@@ -423,6 +436,137 @@ class App:
         self._worker = threading.Thread(target=work, daemon=True)
         self._worker.start()
 
+    # ---------------- 本地下载档位(浏览器下载无感走镜像;PAC 由 SNI 承载) ----------------
+
+    def toggle_tier(self):
+        if self.busy_gate():
+            return
+        try:
+            turning_on = not eng.tier_state()["on"]
+        except Exception:
+            turning_on = True
+        self.set_busy(True, self.tier_btn)
+        self._tick_start("正在%s本地下载档位%s…" % (
+            "开启" if turning_on else "还原",
+            "(首次生成并安装本地 CA)" if turning_on else ""))
+
+        def work():
+            try:
+                if turning_on:
+                    # 档位靠 PAC 把下载域交给本地代理,PAC 没接管就一起开;
+                    # 开着时只对下载域解密,github.com 网页/Cookie 永不解密
+                    eng.cmd_tier(types.SimpleNamespace(action="on", with_sni=True))
+                    ok, msg = True, "下载档位已开启 ✅(浏览器下载自动走最快镜像)"
+                else:
+                    eng.cmd_tier(types.SimpleNamespace(action="off", with_sni=False))
+                    ok, msg = True, "下载档位已还原 ✅(服务已停,CA 已摘除)"
+            except SystemExit as e:   # 引擎用 sys.exit 报业务错误
+                ok, msg = False, "下载档位操作失败:%s" % e
+            except Exception as e:
+                ok, msg = False, "下载档位操作失败:%s" % e
+            self.root.after(0, lambda: self.done(ok, msg))
+
+        self._worker = threading.Thread(target=work, daemon=True)
+        self._worker.start()
+
+    # ---------------- 检查更新 / 一键升级 ----------------
+
+    def _update_boot(self):
+        """启动静默查一次(吃 6h 缓存):有新版只在底栏提示,不弹窗打扰"""
+        time.sleep(4)
+        try:
+            info = eng.update_check_info(force=False)
+        except Exception:
+            return
+        if info.get("update"):
+            tag = info.get("tag") or ("v" + str(info.get("latest") or ""))
+            self.root.after(0, lambda: self._set_update_hint(tag))
+
+    def _set_update_hint(self, tag):
+        self._update_tag = tag
+        if tag:
+            self.footer.config(
+                text="v%s → 新版 %s 可升级 · 托盘右键「检查更新」"
+                     % (eng.__version__, tag), fg="#b58900")
+        else:
+            self.footer.config(
+                text="v%s · 只碰 GitHub · 镜像检测/检查更新在托盘右键菜单"
+                     % eng.__version__, fg="#999999")
+
+    def check_update(self):
+        if self.busy_gate():
+            return
+        self.set_busy(True)
+        self._tick_start("正在检查新版…")
+
+        def work():
+            try:
+                info = eng.update_check_info(force=True)
+            except Exception as e:
+                self.root.after(0, lambda: self._update_failed(e))
+                return
+            self.root.after(0, lambda: self._update_checked(info))
+
+        self._worker = threading.Thread(target=work, daemon=True)
+        self._worker.start()
+
+    def _update_failed(self, e):
+        self.set_busy(False)
+        self.refresh_ui(True)
+        messagebox.showerror(
+            APP, "检查更新失败:%s\n\n链路差时可稍后再试,或命令行:"
+                 "ghspeed update --check" % e)
+
+    def _update_checked(self, info):
+        self.set_busy(False)
+        self.refresh_ui(True)
+        if not info.get("update"):
+            messagebox.showinfo(APP, "已是最新版 v%s ✅" % eng.__version__)
+            return
+        tag = info.get("tag") or ("v" + str(info.get("latest") or ""))
+        asset = (info.get("asset") or {}).get("name") or ""
+        if not messagebox.askyesno(
+                APP, "发现新版 %s\n\n当前 v%s\n%s\n\n下载走镜像通道,sha256 "
+                     "校验通过后自动打开安装包。现在升级?"
+                     % (tag, eng.__version__, asset)):
+            self._set_update_hint(tag)
+            return
+        self._do_update(tag)
+
+    def _do_update(self, tag):
+        self.set_busy(True)
+        self._tick_start("正在下载新版(经镜像通道)…")
+
+        def work():
+            buf = io.StringIO()
+            old, sys.stdout = sys.stdout, buf
+            try:
+                eng.cmd_update(types.SimpleNamespace(check=False, yes=True,
+                                                     json=False, cache=False))
+            except SystemExit as e:   # 引擎的业务错误
+                ok, msg = False, "升级失败:%s" % e
+            except Exception as e:
+                ok, msg = False, "升级失败:%s" % e
+            else:
+                ok, msg = True, "新版 %s 已下载,安装器已打开 ✅" % tag
+            finally:
+                sys.stdout = old
+            text = (buf.getvalue() + "\n" + msg).strip()
+
+            def finish():
+                self.set_busy(False)
+                self.refresh_ui(True)
+                if ok:
+                    self._set_update_hint(None)
+                    messagebox.showinfo(APP, msg)
+                else:
+                    self.show_out(text)
+                    messagebox.showerror(APP, msg)
+            self.root.after(0, finish)
+
+        self._worker = threading.Thread(target=work, daemon=True)
+        self._worker.start()
+
     # ---------------- 活动可视化(并入诊断;详见 ghspeed live) ----------------
 
     def run_diag(self):
@@ -590,7 +734,9 @@ def setup_tray(app):
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("开启/关闭加速", handler(app.toggle)),
         pystray.MenuItem("立即测速刷新", handler(app.refresh_now)),
+        pystray.MenuItem("下载档位(浏览器下载)", handler(app.toggle_tier)),
         pystray.MenuItem("镜像检测", handler(app.check_mirrors)),
+        pystray.MenuItem("检查更新", handler(app.check_update)),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("关于", handler(app.about)),
         pystray.MenuItem("退出", handler(app.quit_app)),

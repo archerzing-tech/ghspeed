@@ -87,8 +87,9 @@ func adminEngine(_ args: [String], done: @escaping (Bool, String) -> Void) {
     DispatchQueue.global().async {
         var ok = false
         var out = ""
-        if FileManager.default.fileExists(atPath: ENGINE_BIN) {
-            var argv = [ENGINE_BIN] + args
+        let base = engineUserBase()
+        if base[0] == ENGINE_BIN {
+            let argv = base + args
             var r = runShell(["/usr/bin/sudo", "-n"] + argv, timeout: 600)
             if r.code != 0 && r.out.contains("a password is required") {
                 // 未免密授权 → 弹密码框;带上 SUDO_USER 让 root 引擎能回读用户侧种子缓存
@@ -98,11 +99,12 @@ func adminEngine(_ args: [String], done: @escaping (Bool, String) -> Void) {
             }
             ok = r.code == 0; out = r.out
         } else {
-            // 引擎还没装到 /usr/local/bin,先 install 再执行目标命令
-            let py = "/usr/bin/python3 \(ENGINE_SCRIPT)"
+            // CLI 缺失或落后于 App:用 App 内引擎,并顺手把 CLI 装成同版本
+            let py = "/usr/bin/python3 '\(ENGINE_SCRIPT)'"
             let cmd = "export SUDO_USER=$(/usr/bin/stat -f %Su /dev/console); "
-                      + "\(py) install && \(py) " + args.joined(separator: " ")
-            let r = adminShell(cmd, prompt: "GitHub 加速首次开启:安装命令行并修改 /etc/hosts")
+                      + "\(py) install >/dev/null 2>&1 || true; \(py) "
+                      + args.joined(separator: " ")
+            let r = adminShell(cmd, prompt: "GitHub 加速需要管理员权限(修改 /etc/hosts)")
             ok = r.code == 0; out = r.out
         }
         DispatchQueue.main.async { done(ok, out) }
@@ -247,6 +249,12 @@ func measureLatency() -> (ms: Int, via: String)? {
 
 // ---------------- 主应用 ----------------
 
+struct UpdateInfo {
+    let latest: String
+    let update: Bool
+    let asset: String
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let menu = NSMenu()
@@ -259,6 +267,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var autostartItem: NSMenuItem!
     var dnsItem: NSMenuItem!
     var sniItem: NSMenuItem!
+    var tierItem: NSMenuItem!
+    var updateItem: NSMenuItem!
     var actionItems: [NSMenuItem] = []
     var busy = false
     var busyT0: Date?
@@ -280,6 +290,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var lastProbeAt = Date.distantPast
     var lastDnsCheck = Date.distantPast
     var lastSniCheck = Date.distantPast
+    var lastTierCheck = Date.distantPast
     var allDownStreak = 0               // 整段不通的连续轮数(≥2 才认,防单次超时误报)
     var healEpisodeNotified = false     // 一段坏窗口「已自动重测」只通知一次
 
@@ -302,19 +313,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         toggleItem = addItem("开启加速", #selector(toggle))
         refreshItem = addItem("立即测速刷新", #selector(refreshNow))
         mirrorsItem = addItem("镜像检测…", #selector(checkMirrors))
+        updateItem = addItem("检查更新…", #selector(checkUpdate))
         menu.addItem(.separator())
         downloadItem = addItem("⬇️ 下载剪贴板中的 GitHub 链接", #selector(downloadClip))
         menu.addItem(.separator())
         autostartItem = addItem("开机自启", #selector(toggleAutostart))
         dnsItem = addItem("系统 DNS 接管(可选)", #selector(toggleDNS))
         sniItem = addItem("浏览器 SNI 分片(可选)", #selector(toggleSNI))
+        tierItem = addItem("本地下载档位(可选)", #selector(toggleTier))
         addItem("关于 GHSpeed", #selector(about))
         addItem("退出", #selector(quit))
-        actionItems = [toggleItem, refreshItem, mirrorsItem, downloadItem, autostartItem, dnsItem, sniItem]
+        actionItems = [toggleItem, refreshItem, mirrorsItem, updateItem, downloadItem,
+                       autostartItem, dnsItem, sniItem, tierItem]
 
         primeFromCache()   // 冷启动先摆上次的结论,菜单第一下打开就有内容
         refreshUI()
         armTimer(120)
+        // 启动后静默查一次更新(吃 6h 缓存):有新版才通知一次,不打断正事
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in
+            self?.autoCheckUpdate()
+        }
+        // 长期挂着的菜单栏应用也别错过新版:每 6 小时再静默看一次
+        Timer.scheduledTimer(withTimeInterval: 6 * 3600, repeats: true) { [weak self] _ in
+            self?.autoCheckUpdate()
+        }
         // 活动轮询:谁的连接正吃着钉选 IP + 最近一条自身动作,5 秒一拍
         Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             DispatchQueue.global().async {
@@ -412,6 +434,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
             }
         }
+        if now.timeIntervalSince(lastTierCheck) > 300 {
+            lastTierCheck = now
+            DispatchQueue.global().async { [weak self] in
+                let tierIsOn = self?.tierOn() ?? false   // 读档位状态文件 + 探端口
+                DispatchQueue.main.async {
+                    guard let self = self, self.busyItem !== self.tierItem else { return }
+                    self.tierItem.state = tierIsOn ? .on : .off
+                    self.tierItem.title = tierIsOn ? "本地下载档位还原(取消接管)"
+                                                   : "本地下载档位(可选)"
+                    saveUiCache("tier_on", tierIsOn)
+                }
+            }
+        }
         // 延迟探测:25 秒内测过直接复用旧值(连开菜单/连点不再刷屏式探测),且探测单飞
         guard !probing else { return }
         guard force || now.timeIntervalSince(lastProbeAt) > 25 else { return }
@@ -454,6 +489,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             sniItem.state = b ? .on : .off
             sniItem.title = b ? "浏览器 SNI 还原(取消分片)" : "浏览器 SNI 分片(可选)"
             lastSniCheck = Date()
+        }
+        if let b = c["tier_on"] as? Bool {
+            tierItem.state = b ? .on : .off
+            tierItem.title = b ? "本地下载档位还原(取消接管)" : "本地下载档位(可选)"
+            lastTierCheck = Date()
         }
     }
 
@@ -784,6 +824,118 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    // ---- 本地下载档位(浏览器下载无感走镜像;PAC 由 SNI 分片承载) ----
+
+    func tierOn() -> Bool {
+        let r = runShell(engineUserCmd(["tier", "state"]), timeout: 15)
+        return r.out.contains("下载档位:已开启")
+    }
+
+    @objc func toggleTier(_ s: Any) {
+        if busy { noteBusy(); return }
+        let on = tierOn()
+        if !on && !sniOn() {
+            let alert = NSAlert()
+            alert.messageText = "开启本地下载档位?"
+            alert.informativeText = "档位靠 PAC 把下载域交给本地代理,需要同时开启"
+                + "「浏览器 SNI 分片」(仅 GitHub 域分流,其余网站直连)。\n\n"
+                + "开启后浏览器下载 release/raw 会被改写到实测最快的镜像通道;"
+                + "github.com 网页与登录 Cookie 永不解密。首次会生成并安装本地 CA"
+                + "(用户级,关闭档位时自动摘除)。"
+            alert.addButton(withTitle: "一起开启")
+            alert.addButton(withTitle: "取消")
+            if alert.runModal() != .alertFirstButtonReturn { return }
+        }
+        var args = ["tier", on ? "off" : "on"]
+        if !on { args.append("--with-sni") }
+        beginAction(tierItem, on ? "⏳ 正在还原下载档位…"
+                                 : "⏳ 正在开启下载档位(首次生成 CA)…")
+        statusLine.title = on ? "⏳ 正在还原下载档位…" : "⏳ 正在开启下载档位…"
+        adminEngine(args) { ok, out in
+            self.endAction()
+            self.lastTierCheck = .distantPast   // 下次打开菜单重查真实态
+            notify("GitHub 加速", ok
+                ? (on ? "已还原下载档位(服务已停,CA 已摘除)"
+                      : "下载档位已开启:浏览器下载无感走镜像 ✅")
+                : "下载档位操作失败:\(out.suffix(140))")
+            self.refreshUI(true)
+        }
+    }
+
+    // ---- 检查更新 / 一键升级(下载走镜像链,校验后打开安装器) ----
+
+    func updateCheck(cache: Bool) -> UpdateInfo? {
+        var args = ["update", "--check", "--json"]
+        if cache { args.append("--cache") }
+        let r = runShell(engineUserCmd(args), timeout: 120)
+        guard let line = r.out.split(separator: "\n").last(where: { $0.hasPrefix("{") }),
+              let o = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+              let latest = o["latest"] as? String else { return nil }
+        let asset = (o["asset"] as? [String: Any])?["name"] as? String ?? ""
+        return UpdateInfo(latest: latest, update: (o["update"] as? Bool) ?? false, asset: asset)
+    }
+
+    func autoCheckUpdate() {
+        guard !busy else { return }
+        DispatchQueue.global().async { [weak self] in
+            guard let info = self?.updateCheck(cache: true), info.update else { return }
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.updateItem.title = "有新版 v\(info.latest)(点此更新)"
+                if (loadUiCache()["update_seen"] as? String) != info.latest {
+                    notify("GitHub 加速",
+                           "发现新版 v\(info.latest) —— 菜单栏 🐙 →「有新版」一键升级")
+                    saveUiCache("update_seen", info.latest)
+                }
+            }
+        }
+    }
+
+    @objc func checkUpdate(_ s: Any) {
+        if busy { noteBusy(); return }
+        beginAction(updateItem, "⏳ 检查更新中…")
+        statusLine.title = "⏳ 正在检查新版…"
+        DispatchQueue.global().async { [weak self] in
+            let info = self?.updateCheck(cache: false)
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.endAction()
+                guard let info = info else {
+                    notify("GHSpeed", "检查更新失败:网络或 GitHub 暂不可达,稍后再试")
+                    self.refreshUI(true)
+                    return
+                }
+                if !info.update {
+                    self.updateItem.title = "检查更新…"
+                    notify("GHSpeed", "已是最新版 v\(APP_VERSION) ✅")
+                    self.refreshUI(true)
+                    return
+                }
+                self.updateItem.title = "有新版 v\(info.latest)(点此更新)"
+                let alert = NSAlert()
+                alert.messageText = "发现新版 v\(info.latest)"
+                alert.informativeText = "当前 v\(APP_VERSION)"
+                    + (info.asset.isEmpty ? "" : "\n安装包:\(info.asset)")
+                    + "\n\n下载走镜像通道(坏窗口也能下),sha256 校验通过后自动打开安装器。"
+                alert.addButton(withTitle: "下载并安装")
+                alert.addButton(withTitle: "稍后")
+                if alert.runModal() != .alertFirstButtonReturn { return }
+                self.beginAction(self.updateItem, "⏳ 下载新版中…")
+                self.statusLine.title = "⏳ 正在下载新版(经镜像通道)…"
+                DispatchQueue.global().async {
+                    let r = runShell(engineUserCmd(["update", "--yes"]), timeout: 900)
+                    DispatchQueue.main.async {
+                        self.endAction()
+                        notify("GHSpeed", r.code == 0
+                            ? "新版 v\(info.latest) 已下载,安装器已打开 ✅"
+                            : "升级失败:\(r.out.suffix(140))")
+                        self.refreshUI(true)
+                    }
+                }
+            }
+        }
+    }
+
     @objc func about(_ s: Any) {
         showTextDialog(
             "🐙 GHSpeed v\(APP_VERSION)\n\n"
@@ -796,21 +948,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func quit(_ s: Any) {
         if busy { noteBusy(); return }   // 正在执行的动作没落地前不退,防半截状态
-        if sniOn() {         // 生命周期契约:退出即还原(弹一次授权;取消则下次启动自愈兜底)
+        if sniOn() || tierOn() {   // 生命周期契约:退出即还原(弹一次授权;取消则下次启动自愈兜底)
             let argv = engineUserCmd(["sni", "off"])
             _ = adminShell(argv.joined(separator: " "),
-                           prompt: "退出前还原浏览器 SNI 分片设置")
+                           prompt: "退出前还原浏览器 SNI 分片 / 下载档位")
         }
         NSApp.terminate(nil)
     }
 }
 
-// 用户权限就能跑的引擎调用
-func engineUserCmd(_ args: [String]) -> [String] {
-    if FileManager.default.fileExists(atPath: ENGINE_BIN) {
-        return [ENGINE_BIN] + args
+// 用户权限就能跑的引擎调用:已装 CLI 与 App 版本不一致时优先用 App 内引擎,
+// 否则新增菜单项(tier/update)会在旧命令上直接报「invalid choice」
+func verTuple(_ s: String) -> (Int, Int, Int) {
+    guard let re = try? NSRegularExpression(pattern: "(\\d+)\\.(\\d+)\\.(\\d+)") else {
+        return (0, 0, 0)
     }
-    return ["/usr/bin/python3", ENGINE_SCRIPT] + args
+    let ns = s as NSString
+    guard let m = re.firstMatch(in: s, range: NSRange(location: 0, length: ns.length)) else {
+        return (0, 0, 0)
+    }
+    return (Int(ns.substring(with: m.range(at: 1))) ?? 0,
+            Int(ns.substring(with: m.range(at: 2))) ?? 0,
+            Int(ns.substring(with: m.range(at: 3))) ?? 0)
+}
+
+func engineUserBase() -> [String] {
+    if FileManager.default.fileExists(atPath: ENGINE_BIN) {
+        let v = runShell([ENGINE_BIN, "--version"], timeout: 10).out
+        // 旧 CLI 不认识新命令 → 用 App 内引擎;CLI 更新则继续用 CLI,别倒退
+        if verTuple(v) >= verTuple(APP_VERSION) {
+            return [ENGINE_BIN]
+        }
+    }
+    return ["/usr/bin/python3", ENGINE_SCRIPT]
+}
+
+func engineUserCmd(_ args: [String]) -> [String] {
+    return engineUserBase() + args
 }
 
 func runEngineMirrors() -> (code: Int32, out: String) {
