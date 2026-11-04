@@ -2968,6 +2968,16 @@ def cmd_install(args):
 
 
 def main():
+    if IS_WIN:
+        # 控制台代码页不认中文时(cp1252/437…),print 中文直接 UnicodeEncodeError
+        # 崩掉整条命令(sni/tier 状态输出全是中文)。保留原编码、只放宽 errors:
+        # GBK 控制台显示不变,极端代码页下中文变 '?' 占位,但绝不崩。
+        for _s in (sys.stdout, sys.stderr):
+            if _s is not None and hasattr(_s, "reconfigure"):
+                try:
+                    _s.reconfigure(errors="replace")
+                except Exception:
+                    pass
     ap = argparse.ArgumentParser(
         prog="ghspeed", description="GitHub 专用加速工具(只碰 GitHub,不碰其他网络)")
     ap.add_argument("--version", action="version",
