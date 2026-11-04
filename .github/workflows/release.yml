@@ -68,8 +68,8 @@ jobs:
           pip install pyinstaller pillow pystray
           python -c "from PIL import Image; im = Image.open('icons/icon_1024.png'); im.save('icons/icon.ico', sizes=[(16,16),(24,24),(32,32),(48,48),(64,64),(128,128),(256,256)])"
           Copy-Item ghspeed_gui.pyw gui_entry.py
-          pyinstaller --onefile --noconsole --name GHSpeed --icon icons/icon.ico --add-data "icons/icon_1024.png;icons" --add-data "ghspeed_sni.py;." --hidden-import pystray._win32 gui_entry.py
-          pyinstaller --onefile --name ghspeed-cli --icon icons/icon.ico --add-data "ghspeed_sni.py;." ghspeed.py
+          pyinstaller --onefile --noconsole --name GHSpeed --icon icons/icon.ico --add-data "icons/icon_1024.png;icons" --add-data "ghspeed_sni.py;." --hidden-import pystray._win32 --hidden-import socketserver gui_entry.py
+          pyinstaller --onefile --name ghspeed-cli --icon icons/icon.ico --add-data "ghspeed_sni.py;." --hidden-import socketserver ghspeed.py
 
       - name: 冒烟测试(GHSpeed.exe 必须真机启动出可见 GUI 窗口;CLI 可运行)
         shell: pwsh
@@ -94,6 +94,13 @@ jobs:
           $v = & dist\ghspeed-cli.exe --version
           Write-Host "CLI: $v"
           if ($v -notmatch "ghspeed") { exit 1 }
+          # SNI 插件回归门禁:插件是运行时从文件懒加载的,它的顶层依赖
+          # (socketserver 等)不在引擎 import 图里,漏了 --hidden-import 时
+          # 只有真加载才炸。用 sni git 门禁:插件加载失败时引擎 sys.exit
+          # 非零退出(sni state 会优雅降级成 0 退出,门不住);插件在时
+          # 只读一条 git 配置,无副作用。
+          & dist\ghspeed-cli.exe sni git
+          if ($LASTEXITCODE -ne 0) { Write-Host "SNI 插件加载失败(打包缺依赖)"; exit 1 }
 
       - name: Build installer (Inno Setup)
         shell: pwsh
@@ -144,11 +151,22 @@ jobs:
 
           GitHub 专用加速工具:测速固定最快 IP 到 hosts + 镜像加速下载。只碰 GitHub,不碰其他网络。
 
+          ### v0.6.2 变更(热修:下载档位/SNI 分片在打包版报「找不到 ghspeed_sni.py」)
+          - **插件依赖进包**:ghspeed_sni.py 是运行时懒加载的,它的顶层依赖
+            (socketserver)不在引擎 import 图里,PyInstaller 没打进去——打包版里
+            点「下载档位」「SNI 分片」加载即炸(还被误报成「文件缺失,重装可修复」,
+            掩盖了真因)。已补 `--hidden-import socketserver`,CI 冒烟新增
+            「插件真加载」门禁,以后这类缺失直接构建失败,不再带病发布
+          - **引擎补齐插件转发层**:v0.5.1 拆插件时薄封装漏了 sni_pac_on/
+            sni_start_inproc/_sni_spawn_relay/sni_cfg 等一批,Windows 界面的
+            SNI 按钮即使插件在也会 AttributeError。现在引擎模块级 `__getattr__`
+            把 sni_*/tier_*/cmd_sni*/cmd_tier* 一律转发给插件,以后插件新增函数
+            eng.* 自动可用,不再漂移;插件加载失败时错误信息如实显示真因
+          - 顺带(含 v0.6.1 重发布热修):Windows 单实例守卫——GHSpeed.exe 被反复
+            拉起不再无限弹窗;提权失败不再自我循环;自更新后底栏不再误报「可升级」。
+            **装着坏 v0.6.1 的用户会收到应用内升级提示(托盘「检查更新」)**
+
           ### v0.6.1 变更(能力补全:界面入口 + 自更新)
-          - **热修(重发布):Windows「无限弹窗」**——GHSpeed.exe 被反复拉起时(安装器/
-            旧计划任务等)窗口无限堆叠;现在加了单实例守卫:第二个实例只把已有主窗口
-            带到前台就退出,任何来源的重复拉起都不再刷屏。附:提权失败不再自我循环、
-            自更新完成后底栏不再误报「可升级」。**之前装过 v0.6.1 的请重新下载安装**
           - **下载档位接进两个界面**:macOS 菜单栏「本地下载档位(可选)」、Windows 窗口
             「下载档位」按钮——点一下即可,依赖的 SNI 分片会自动连带开启(不再需要先记
             `sni on`);关闭时服务、本地 CA、PAC 一起收口。首次开启会生成并安装本地 CA,

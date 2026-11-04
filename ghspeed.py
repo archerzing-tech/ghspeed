@@ -107,9 +107,9 @@ REFRESH_INTERVAL = 1800  # 秒
 try:
     with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "VERSION")) as _f:
-        __version__ = _f.read().strip() or "0.6.1"
+        __version__ = _f.read().strip() or "0.6.2"
 except Exception:
-    __version__ = "0.6.1"
+    __version__ = "0.6.2"
 
 # 只处理这些 GitHub 域名,一个都不多
 DOMAINS = [
@@ -2493,6 +2493,7 @@ def dns_is_on():
 # 安装不完整,核心功能分毫不差。
 
 _SNI_MOD = []
+_SNI_ERR = ""    # 插件不可用的真实原因(文件缺失/依赖缺失/代码异常),报错时透传
 
 
 def _sni_module_path():
@@ -2510,11 +2511,13 @@ def _sni_module_path():
 
 
 def sni_mod():
-    """懒加载 SNI 插件;找不到/加载失败返回 None(调用方按未开启降级)"""
+    """懒加载 SNI 插件;找不到/加载失败返回 None(真实原因记在 _SNI_ERR,
+    调用方报错必须带上——「加载失败」曾被误报成「文件缺失」,坑过排查)"""
     if _SNI_MOD:
         return _SNI_MOD[0]
     path = _sni_module_path()
     if not path:
+        globals()["_SNI_ERR"] = "没找到 ghspeed_sni.py(安装不完整)"
         return None
     try:
         import importlib.util
@@ -2524,13 +2527,18 @@ def sni_mod():
             m.__dict__.setdefault(k, v)        # 常量(_SNI_DIR 等)要用引擎设施
         m.__dict__["_ENGINE_FILE"] = os.path.realpath(__file__)   # 插件回启引擎用(spawn 命令行是以引擎为入口的)
         spec.loader.exec_module(m)
-    except Exception:
+    except Exception as e:
+        globals()["_SNI_ERR"] = "%s: %s" % (type(e).__name__, e)
         if os.environ.get("GHSPEED_DEBUG"):
             import traceback
             traceback.print_exc()
         return None
     _SNI_MOD.append(m)
     return m
+
+
+def _sni_missing_exit():
+    sys.exit("SNI 插件不可用:%s(重新安装最新版可修复)" % _SNI_ERR)
 
 
 def _sni_stub():
@@ -2571,7 +2579,7 @@ def cmd_tier(args):
         if getattr(args, "action", None) in (None, "state", "off"):
             print("下载档位:未开启(SNI 插件缺失时不影响开关加速等其他功能)")
             return
-        sys.exit("SNI 插件缺失:没找到 ghspeed_sni.py(重新安装最新版可修复)")
+        _sni_missing_exit()
     m.cmd_tier(args)
 
 
@@ -2579,11 +2587,30 @@ def cmd_sni(args):
     m = sni_mod()
     if not m:
         if args.action in ("state", "off"):
-            print("SNI 分片:未开启(插件文件 ghspeed_sni.py 缺失,重装可修复;"
-                  "不影响其他功能)")
+            print("SNI 分片:未开启(%s;不影响其他功能)" % _SNI_ERR)
             return
-        sys.exit("SNI 插件缺失:没找到 ghspeed_sni.py(重新安装最新版可修复)")
+        _sni_missing_exit()
     m.cmd_sni(args)
+
+
+def __getattr__(name):
+    """引擎没显式定义的 sni_*/tier_* 属性,一律转发给懒加载的 SNI 插件。
+
+    插件函数(引擎命名空间已注入,内部互调不需要转发)与界面直用函数
+    (eng.sni_pac_on/eng._sni_spawn_relay…)是两回事:后者必须经本转发,
+    否则 AttributeError。v0.5.1 拆插件时薄封装漏了 sni_pac_on 一批,
+    Windows 界面的 SNI/档位按钮因此挂过——靠逐个补封装不可持续,
+    插件以后新增函数,eng.* 自动可用,不再漂移。
+    显式定义的包装(state/off/heal 等)优先级更高,不受本转发影响。"""
+    if name.startswith(("sni_", "tier_", "_sni_", "_tier_", "SNI_", "TIER_",
+                        "cmd_sni", "cmd_tier")):
+        m = sni_mod()
+        if m is not None and hasattr(m, name):
+            return getattr(m, name)
+        raise AttributeError(
+            "module 'ghspeed' has no attribute %r(SNI 插件:%s)"
+            % (name, _SNI_ERR or "未加载"))
+    raise AttributeError("module 'ghspeed' has no attribute %r" % name)
 
 
 def cmd_live(args):
