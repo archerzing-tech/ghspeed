@@ -9,7 +9,7 @@ release 资产回源实测(防「根路径活着但代理是死的」),测速失
 
 | 平台 | 界面 | 最低要求 |
 |---|---|---|
-| macOS | 菜单栏 🐙 | 10.13+ |
+| macOS | 菜单栏 🐙(通用二进制,Intel / Apple Silicon) | 10.15+ |
 | Windows | 安装包 / 便携版(tkinter 窗口)+ 命令行 | Windows 10+(运行时内置,无需装 Python) |
 | Linux(Debian 系) | 命令行(无 UI) | Python 3,systemd |
 
@@ -41,7 +41,7 @@ release 资产回源实测(防「根路径活着但代理是死的」),测速失
 
 从 [Releases](../../releases) 按平台下载对应包:
 
-### macOS 10.13+
+### macOS 10.15+
 
 **方式一:`.pkg` 安装包(推荐,双击即装)**
 
@@ -65,6 +65,9 @@ release 资产回源实测(防「根路径活着但代理是死的」),测速失
 git clone https://github.com/archerzing-tech/ghspeed.git
 cd ghspeed && sudo ./install.sh && sudo ghspeed on
 ```
+
+> 菜单栏 App 依赖 macOS 自带的 `python3`(随「命令行开发工具」提供)。首次启动若缺少,
+> App 会弹窗说明并带「立即安装」按钮;也可以先在终端执行 `xcode-select --install`。
 
 ### Windows 10+
 
@@ -126,6 +129,7 @@ sudo ghspeed off                 # 完全还原
 ### 命令行(三平台通用)
 
 ```
+ghspeed                    不带参数:一屏速览(当前状态、缓存新旧、下一步命令)
 ghspeed on | off          开启/关闭(还原 hosts 与定时任务)
 ghspeed status            查看固定 IP、延迟、守护状态 + 多级通道自检
 ghspeed probe             手动测速(不写 hosts)

@@ -6,6 +6,12 @@ cd "$(dirname "$0")"
 
 VERSION=$(cat VERSION)
 APP=dist/GHSpeed.app
+# 最低系统版本:Swift 运行时自 10.14.4 起才随系统提供,低于它的机器需要
+# 额外内嵌 Swift 标准库,故统一按 10.15(Catalina)构建。
+# 不显式指定 -target 时 swiftc 会拿"构建机当前系统版本"当 minos,
+# 在 macOS 14 上编出来的包就装不进 macOS 13(报"需要 macOS 14")。
+MIN_MACOS="${MIN_MACOS:-10.15}"
+ARCHS="${ARCHS:-x86_64 arm64}"          # 通用二进制:Intel + Apple Silicon
 
 # 清理上一次产物;若含 root 属主残留(被系统 installer 摸过的 dist),
 # rm 会失败 —— 改为整体挪走(父目录归用户,mv 不受内部属主影响)
@@ -24,11 +30,19 @@ cat > "$APP/Contents/Info.plist" <<EOF
     <key>CFBundleShortVersionString</key><string>$VERSION</string>
     <key>CFBundleVersion</key><string>$VERSION</string>
     <key>LSUIElement</key><true/>
-    <key>LSMinimumSystemVersion</key><string>10.13</string>
+    <key>LSMinimumSystemVersion</key><string>$MIN_MACOS</string>
 </dict></plist>
 EOF
 
-swiftc -O menubar.swift -o "$APP/Contents/MacOS/GHSpeed"
+# 分别按目标架构编译再 lipo 合并(swiftc 一次只能出一个架构)
+BINS=()
+for arch in $ARCHS; do
+    out="dist/.GHSpeed-$arch"
+    swiftc -O -target "$arch-apple-macos$MIN_MACOS" menubar.swift -o "$out"
+    BINS+=("$out")
+done
+lipo -create "${BINS[@]}" -output "$APP/Contents/MacOS/GHSpeed"
+rm -f "${BINS[@]}"
 cp ghspeed.py "$APP/Contents/Resources/"
 cp ghspeed_sni.py "$APP/Contents/Resources/"   # 可选插件:SNI 分片(引擎按需懒加载)
 

@@ -151,6 +151,19 @@ jobs:
 
           GitHub 专用加速工具:测速固定最快 IP 到 hosts + 镜像加速下载。只碰 GitHub,不碰其他网络。
 
+          ### v0.6.3 变更(兼容与上手体验)
+          - **修复 macOS 13 / 14 打不开**:旧构建没指定部署目标,swiftc 把构建机的
+            系统版本(14.0)写进了二进制,导致 macOS 13 用户被提示「需要 macOS 14」。
+            现在显式按 10.15 构建(`LSMinimumSystemVersion` 同步),并输出
+            Intel + Apple Silicon **通用二进制**——Apple Silicon 不再依赖 Rosetta
+          - **无参数速览**:终端直接敲 `ghspeed`,一屏看到是否已开启、缓存多旧、
+            下一步该敲哪条命令,不再先吃一个 argparse 用法错误
+          - **状态页说人话**:「上次测速 16655 分钟前」改成「12 天前」,缓存超过
+            1 小时会提示 `ghspeed probe` 重测
+          - **macOS 首次启动依赖引导**:缺少命令行开发工具(python3)时弹窗解释原因,
+            点「立即安装」直接打开 Apple 安装窗口;状态行也会明确提示,不再出现
+            「点开启没反应」
+
           ### v0.6.2 变更(热修:下载档位/SNI 分片在打包版报「找不到 ghspeed_sni.py」)
           - **插件依赖进包**:ghspeed_sni.py 是运行时懒加载的,它的顶层依赖
             (socketserver)不在引擎 import 图里,PyInstaller 没打进去——打包版里

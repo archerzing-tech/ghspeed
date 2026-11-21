@@ -107,9 +107,9 @@ REFRESH_INTERVAL = 1800  # 秒
 try:
     with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "VERSION")) as _f:
-        __version__ = _f.read().strip() or "0.6.2"
+        __version__ = _f.read().strip() or "0.6.3"
 except Exception:
-    __version__ = "0.6.2"
+    __version__ = "0.6.3"
 
 # 只处理这些 GitHub 域名,一个都不多
 DOMAINS = [
@@ -1362,11 +1362,40 @@ def cmd_refresh(args):
         print("ghspeed: 已更新测速缓存(root 运行才会写 hosts)")
 
 
+def cmd_home(args=None):
+    """无参数时的速览页:一眼看到当前状态、缓存新旧和下一步该敲什么。
+    不联网、不写盘,毫秒级返回——第一次接触不该先吃一个 argparse 用法错误。"""
+    try:
+        pinned = len(current_map_from_hosts())
+    except Exception:
+        pinned = 0
+    st = load_state()
+    prefix = "" if IS_WIN or is_admin() else "sudo "
+    print("GHSpeed %s · GitHub 专用加速(只碰 GitHub,不碰其他网络)" % __version__)
+    print()
+    print("  状态  %s" % ("🚀 已开启:%d 个域名固定到最快 IP" % pinned
+                         if pinned else "🐙 未开启"))
+    print("  缓存  %s" % ("上次测速 %s" % _fmt_when(st.get("time"))
+                         if st and st.get("time") else "尚未测速"))
+    print()
+    print("  常用命令")
+    rows = [
+        (prefix + "ghspeed on", "开启:测速 + 固定 IP + 定时刷新(约 20 秒)"),
+        (prefix + "ghspeed off", "关闭:完整还原 hosts 与定时任务"),
+        ("ghspeed status", "状态、延迟与多级通道自检"),
+        ("ghspeed dl <URL>", "经镜像下载 GitHub 文件(大文件 / 整仓都行)"),
+        ("ghspeed --help", "全部命令(probe / mirrors / sni / tier …)"),
+    ]
+    for cmd, desc in rows:
+        print("    %-20s%s" % (cmd, desc))
+
+
 def cmd_status(args):
     st = load_state()
     if st:
-        age_min = (time.time() - st["time"]) / 60
-        print("上次测速:%.0f 分钟前" % age_min)
+        age = time.time() - st.get("time", 0)
+        hint = "(缓存较旧,可运行 ghspeed probe 重测)" if age > REFRESH_INTERVAL * 2 else ""
+        print("上次测速:%s%s" % (_fmt_when(st.get("time")), hint))
         for d in sorted(st["map"]):
             print("  %-38s %-16s %4d ms"
                   % (d, st["map"][d]["ip"], st["map"][d]["rtt_ms"]))
@@ -2982,7 +3011,7 @@ def main():
         prog="ghspeed", description="GitHub 专用加速工具(只碰 GitHub,不碰其他网络)")
     ap.add_argument("--version", action="version",
                     version="ghspeed " + __version__ + " (macOS/Windows/Linux)")
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub = ap.add_subparsers(dest="cmd", required=False)
 
     sub.add_parser("on", help="启用:测速 + 固定最快 IP 到 hosts + 装定时刷新(root)").set_defaults(func=cmd_on)
     sub.add_parser("off", help="停用:还原 hosts + 卸载定时任务(root)").set_defaults(func=cmd_off)
@@ -3073,14 +3102,17 @@ def main():
     p.set_defaults(func=cmd_sni)
 
     if IS_WIN and len(sys.argv) == 1:
-        # 双击 ghspeed.exe 时别让黑窗一闪而过:打印帮助后等回车
+        # 双击 ghspeed.exe 时别让黑窗一闪而过:先摆速览页,再等回车
         try:
-            ap.print_help()
+            cmd_home()
             input("\n按回车键退出…")
         except Exception:
             pass
         return
     args = ap.parse_args()
+    if not args.cmd:
+        cmd_home()
+        return
     args.func(args)
 
 

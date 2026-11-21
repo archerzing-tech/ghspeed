@@ -14,6 +14,13 @@ let ENGINE_SCRIPT: String = {
     return NSHomeDirectory() + "/work/ghspeed/ghspeed.py"
 }()
 let ENGINE_BIN = "/usr/local/bin/ghspeed"
+
+// 引擎跑在 /usr/bin/python3 上,而这个解释器由「命令行开发工具」提供。
+// 没装时所有动作都会失败——启动先查一次,给出可点的安装引导,别让用户干瞪眼。
+func engineDepsReady() -> Bool {
+    guard FileManager.default.isExecutableFile(atPath: "/usr/bin/python3") else { return false }
+    return runShell(["/usr/bin/xcode-select", "-p"], timeout: 10).code == 0
+}
 // App 自身位置(从可执行文件路径反推),装在哪开机自启就指向哪
 let APP_BUNDLE: String = {
     if let exe = Bundle.main.executableURL?.path {
@@ -271,6 +278,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var updateItem: NSMenuItem!
     var actionItems: [NSMenuItem] = []
     var busy = false
+    var depsMissing = false             // 缺 python3 / 命令行开发工具:界面明确提示,不装作没事
     var busyT0: Date?
     var downloading = false
     var timer: Timer?
@@ -362,6 +370,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // 不写 hosts、绝不弹密码)。之后点开启/刷新大多走种子轮,几秒收工;
         // 若已开启且配了免密授权,顺手静默应用一轮,没配就到此为止。
         DispatchQueue.global().async { [weak self] in
+            guard engineDepsReady() else {
+                DispatchQueue.main.async {
+                    guard let self = self else { return }
+                    self.depsMissing = true
+                    self.refreshUI(true)
+                    self.promptInstallDeps()
+                }
+                return
+            }
             // 顺序讲究:probe 最优先 —— 种子缓存热了,点「开启加速」才能几秒收工;
             // sni heal 只是孤儿清扫,排最后,不挡正事
             _ = runShell(engineUserCmd(["probe"]), timeout: 300)
@@ -383,6 +400,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    // 缺运行依赖时的一次性引导:xcode-select --install 只弹 Apple 安装窗,不需要管理员密码
+    func promptInstallDeps() {
+        let alert = NSAlert()
+        alert.messageText = "还差一步:安装「命令行开发工具」"
+        alert.informativeText = "GHSpeed 的加速引擎使用 macOS 自带的 python3 运行。\n"
+            + "点「立即安装」会打开 Apple 的安装窗口(约 1–2 分钟,无需重启),"
+            + "装好后重新打开 GHSpeed 即可。"
+        alert.addButton(withTitle: "立即安装")
+        alert.addButton(withTitle: "稍后")
+        if alert.runModal() == .alertFirstButtonReturn {
+            _ = runShell(["/usr/bin/xcode-select", "--install"], timeout: 60)
+            notify("GHSpeed", "安装窗口已打开;装好后请重新打开 GHSpeed")
+        }
+    }
+
     func addItem(_ title: String, _ action: Selector) -> NSMenuItem {
         let it = menu.addItem(withTitle: title, action: action, keyEquivalent: "")
         it.target = self
@@ -395,7 +427,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // 绝不把界面打回「检测中…」干等 —— 菜单开合要即时有内容。
     func refreshUI(_ force: Bool = false) {
         let (on, count) = hostsOn()
-        if !busy {   // 动作进行中,状态行让位给「⏳ 正在…」提示
+        if depsMissing {
+            statusLine.title = "⚠️ 缺少运行依赖:请安装命令行开发工具后重开"
+        } else if !busy {   // 动作进行中,状态行让位给「⏳ 正在…」提示
             statusLine.title = on
                 ? "🚀 加速已开启(固定 \(count) 个域名)"
                 : "🐙 加速未开启"
